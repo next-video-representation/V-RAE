@@ -56,13 +56,20 @@ class GradientAccumulator:
             raise RuntimeError("Checkpointing is only allowed at an optimizer-step boundary")
 
 
-def optimizer_step(
+def clip_and_step(
     optimizer: torch.optim.Optimizer,
     *,
     scaler: Any = None,
     max_grad_norm: float | None = None,
     parameters=None,
-) -> bool:
+) -> tuple[bool, torch.Tensor | None]:
+    """Optionally clip, then step. Returns (stepped, total gradient norm before clipping).
+
+    The norm is ``None`` when ``max_grad_norm`` is ``None``; with a GradScaler it is
+    measured on the unscaled gradients.
+    """
+
+    grad_norm = None
     if max_grad_norm is not None:
         max_grad_norm = float(max_grad_norm)
         if max_grad_norm <= 0:
@@ -73,14 +80,27 @@ def optimizer_step(
             parameters = [
                 parameter for group in optimizer.param_groups for parameter in group["params"]
             ]
-        torch.nn.utils.clip_grad_norm_(parameters, max_grad_norm)
+        grad_norm = torch.nn.utils.clip_grad_norm_(parameters, max_grad_norm)
     if scaler is None:
         optimizer.step()
-        return True
+        return True, grad_norm
     scale_before = float(scaler.get_scale())
     scaler.step(optimizer)
     scaler.update()
     # GradScaler lowers the scale exactly when non-finite gradients caused the
     # optimizer update to be skipped.  Callers must not advance LR/EMA/step in
     # that case.
-    return float(scaler.get_scale()) >= scale_before
+    return float(scaler.get_scale()) >= scale_before, grad_norm
+
+
+def optimizer_step(
+    optimizer: torch.optim.Optimizer,
+    *,
+    scaler: Any = None,
+    max_grad_norm: float | None = None,
+    parameters=None,
+) -> bool:
+    stepped, _ = clip_and_step(
+        optimizer, scaler=scaler, max_grad_norm=max_grad_norm, parameters=parameters
+    )
+    return stepped

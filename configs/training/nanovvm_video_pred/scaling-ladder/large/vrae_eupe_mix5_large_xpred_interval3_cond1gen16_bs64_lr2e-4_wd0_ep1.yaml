@@ -1,0 +1,18 @@
+# mix5 scaling ladder, large: k = 14 heads, encoder depth L = 27.
+# Scaling rule (one knob k; the default dit_first_frame_prediction.yaml is k = 16, L = 28):
+#   encoder width 72k (head_dim 72), decoder width 128k (head_dim 128), k heads each,
+#   decoder depth max(1, round(L/14)), encoder_depth round(L*8/28), mlp_ratio 4.
+# DiT parameters: 628.1M total, 494.3M encoder blocks, 115.7M decoder blocks
+# (-0.2% vs NanoVVM large, 629.5M: n_layer 32, n_embd 1280, n_head 20).
+# Everything else is in ../_mix5_common.yaml. Lists are replaced, not merged, by includes,
+# so dit.* and wandb.tags are written out in full.
+include: ../_mix5_common.yaml
+run_name: vrae_eupe_mix5_large_xpred_interval3_cond1gen16_bs64_lr2e-4_wd0_ep1
+dit:
+  hidden_size: [1008, 1792]
+  depth: [27, 2]
+  num_heads: [14, 14]
+  encoder_depth: 8
+  mlp_ratio: 4.0
+wandb:
+  tags: [nanovvm, video_prediction, first_frame, eupe, mix5, scaling_ladder, large]

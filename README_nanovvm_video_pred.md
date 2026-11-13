@@ -93,6 +93,7 @@ follows the future latent size, `sqrt(4*h*w*C/4096)`; for EUPE-B/16 at 256x256 t
 | `configs/training/nanovvm_video_pred/eupe_mix5.yaml` | 18 train and 18 val sources of NanoVVM's mix5 config (`split_val0.0001_min100` holdout) |
 | `configs/training/nanovvm_video_pred/eupe_bridgedatav2.yaml` | single-source example |
 | `configs/training/nanovvm_video_pred/_eupe_common.yaml` | shared settings; not runnable alone |
+| `configs/training/nanovvm_video_pred/scaling-ladder/` | six mix5 sizes matched to NanoVVM's ladder (see [Scaling Ladder](#scaling-ladder)) |
 | `configs/models/dit_first_frame_prediction.yaml` | DiT architecture |
 
 The mix5 sources come from NanoVVM's
@@ -214,10 +215,173 @@ Training logs the same comparison against the RGB target every
 `wandb.sample_interval` steps. The 17-frame first-frame-plus-prediction video is logged
 under a separate name.
 
+## Scaling Ladder
+
+Six DiT sizes whose parameter counts match NanoVVM's six mix5 ladder sizes. The reference
+is NanoVVM's batch-64 ladder at nanovvm@94cc92d,
+`configs/scaling-ladder/<size>/mix5_<size>_vpred_interval3_l1_cond1gen16_bs64_lr2e-4_wd0_ep1.yaml`.
+The six runs share NanoVVM's data, augmentation, optimization recipe and W&B destination.
+Only the DiT size differs between them.
+
+```text
+configs/training/nanovvm_video_pred/scaling-ladder/
+  _mix5_common.yaml     include: ../eupe_mix5.yaml + every shared setting (not runnable alone)
+  <size>/vrae_eupe_mix5_<size>_xpred_interval3_cond1gen16_bs64_lr2e-4_wd0_ep1.yaml
+                        include: ../_mix5_common.yaml + run_name (= file stem), dit, wandb.tags
+```
+
+Config includes merge mappings but replace lists, so each size file writes out the full
+`[encoder, decoder]` lists and the full tag list. The `vrae_` prefix keeps these runs apart
+from NanoVVM's `mix5_<size>_vpred_...` runs in the shared W&B project.
+
+### Scaling Rule
+
+The DiT is a DDT: an AdaLN encoder (the trunk) followed by a shallow, wide decoder (the
+DDT head). NanoVVM's `n_layer/n_embd/n_head` are not copied. Instead, the default DiT
+(`configs/models/dit_first_frame_prediction.yaml`, 843.3M parameters) is scaled with all
+of its ratios kept:
+
+| | encoder | decoder (DDT head) |
+| --- | --- | --- |
+| width | 1152 | 2048 = 16/9 of the encoder width |
+| heads x head_dim | 16 x 72 | 16 x 128 |
+| SwiGLU FFN hidden, `int(2/3 * 4.0 * width)` | 3072 | 5461 |
+| depth | 28 (width/depth 41.1) | 2 = encoder depth / 14 |
+| block parameters | 669.5M | 151.1M (17.9% of the total) |
+
+There is one knob, the head count `k` (16 in the default):
+
+- encoder: width `72k`, `k` heads, depth `L`;
+- decoder: width `128k`, `k` heads, depth `max(1, round(L / 14))`;
+- `encoder_depth = round(L * 8 / 28)`, the block after which the base head reads out;
+- `mlp_ratio: 4.0`; every other `dit` key is the default's.
+
+For each size, `k` and `L` are chosen so that the total DiT parameter count matches
+NanoVVM's model of that size, with the encoder's width/depth near the default's 41.
+NanoVVM's own ladder uses n_embd/n_layer = 40. The counts below were measured on the meta
+device for both repositories:
+
+| size | k | `dit.hidden_size` | `dit.depth` | `dit.num_heads` | `dit.encoder_depth` | width/depth | DiT params: total / encoder blocks / decoder blocks | NanoVVM | diff |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| tiny | 3 | [216, 384] | [6, 1] | [3, 3] | 2 | 36.0 | 9.5M / 5.1M / 2.7M | 9.9M | -3.6% |
+| small | 7 | [504, 896] | [13, 1] | [7, 7] | 4 | 38.8 | 80.0M / 59.6M / 14.5M | 78.8M | +1.6% |
+| medium | 11 | [792, 1408] | [19, 1] | [11, 11] | 5 | 41.7 | 262.7M / 214.8M / 35.7M | 265.7M | -1.1% |
+| large | 14 | [1008, 1792] | [27, 2] | [14, 14] | 8 | 37.3 | 628.1M / 494.3M / 115.7M | 629.5M | -0.2% |
+| xl | 18 | [1296, 2304] | [33, 2] | [18, 18] | 9 | 39.3 | 1217.5M / 998.5M / 191.2M | 1229.2M | -0.9% |
+| xxl | 22 | [1584, 2816] | [37, 3] | [22, 22] | 11 | 42.8 | 2140.0M / 1672.1M / 428.4M | 2124.1M | +0.8% |
+
+The 3D RoPE accepts any even head_dim, so 72 and 128 work at every size.
+
+### Aligned with NanoVVM
+
+| | NanoVVM bs64 ladder | Here |
+| --- | --- | --- |
+| Data | 18 mix5 sources, `split_val0.0001_min100` holdout | inherited unchanged from `eupe_mix5.yaml` |
+| Augmentation | 256x256; short-side bilinear resize, `antialias: false`; center crop; flip 0; 17 frames at interval 3 from each record's fixed start; sources concatenated and reshuffled every epoch | the same port (`data.py`), checked by an exact equality test against a verbatim copy of NanoVVM's `data/online.py` functions |
+| Optimizer | AdamW, lr 2e-4, betas (0.9, 0.95), weight decay 0, eps 1e-8 | the same |
+| Schedule | cosine, `warmup_ratio: 0.02` (from zero), `decay_end_ratio: 1.0`, final lr 2e-5, as fractions of the total optimizer steps | the same keys, with NanoVVM's LR formula, validation and `round()` |
+| Batch | global 64, accumulation 4, 1 epoch | the same |
+| Clipping | `clip_grad: 1.0` | the same |
+| EMA decay | 0.9995 | the same |
+| Precision | bf16 autocast (`scripts/train.sh` default) | bf16 |
+| Checkpoints | every 5000 optimizer steps | every 5000 optimizer steps |
+| W&B destination | `--wandb`, online, `ENTITY`/`PROJECT` from the environment (`zhaosh5t5an`/`nanovvm`) | `wandb.entity: zhaosh5t5an`, `wandb.project: nanovvm`, `mode: online`, written in the config |
+| W&B intervals | metrics every 5 steps, up to 4 sample clips every 500 steps | `log_interval: 5`, `sample_interval: 500`, `sample_count: 4` |
+| W&B metric names | `loss/train`, `loss/train_epoch`, `optimizer/{lr,grad_norm,grad_rms,grad_clip_scale}`, `parameters/{norm,rms}` | the same names, plus `loss/train_full` and `loss/train_base` for the two flow-matching terms |
+
+Notes on the alignment:
+
+- V-RAE does not read the `ENTITY`/`PROJECT` environment variables. They are exported
+  globally on this cluster, so reading them would send every other V-RAE task to the
+  NanoVVM project. Configs without `wandb.entity` call `wandb.init` as before.
+- The W&B run name is `run_name`, i.e. the file stem. Exact resume continues the same W&B
+  run through the uuid stored in `run_metadata.yaml`, not NanoVVM's name hash. Without an
+  API key (`WANDB_API_KEY` or a saved login), the run falls back to offline logging.
+- `loss/train` is the mean, over the optimizer steps since the previous log, of each step's
+  mean micro-batch loss, averaged over ranks. NanoVVM logs rank 0 and divides by
+  `log_interval`; the two agree whenever the window is full. Gradient statistics are
+  window means of the norm before clipping, its RMS over the gradient elements and
+  `clip_grad / max(norm, clip_grad)`. `parameters/*` cover the trainable DiT parameters
+  after the update. `train/epoch`, `train/global_batch_size`, the `samples/...` videos
+  and the JSON line on stdout remain. NanoVVM's model diagnostics (`velocity/*`,
+  `qk_norm/*`, `block_*`) have no counterpart here.
+- NanoVVM's `weight_decay_split: gpt` has no effect at weight decay 0 and is not ported.
+- `latent_normalizer` is inherited from `eupe_mix5.yaml`. All six sizes share one
+  future-latent statistics file, because it depends only on stage 1 and the train data.
+
+With NanoVVM's 20,978,653 mix5 train clips, one epoch at batch 64 is 327,791 optimizer
+steps. Warmup is `round(0.02 * 327,791) = 6,556` steps, and the cosine ends at step
+327,791. The trainer prints the resolved schedule at start-up and records it in
+`run_metadata.yaml` under `lr_schedule`.
+
+### Shared Code Changes
+
+These changes are needed by the ladder and leave the other tasks' behavior unchanged:
+
+- `common/optim.py`: `build_scheduler` also accepts `warmup_ratio` and `decay_end_ratio`
+  with an `epochs` argument. A ratio schedule may not be combined with
+  `warmup_steps/warmup_epochs/decay_end_steps/decay_end_epoch`, except as `null`. The
+  ladder writes `warmup_steps: null` to switch off the `warmup_steps: 0` inherited from
+  `_eupe_common.yaml`. The existing keys produce the same LR at every step as before.
+- `common/accumulation.py`: `clip_and_step` returns the gradient norm before clipping.
+  `optimizer_step` still returns only the step flag.
+- `common/wandb.py`: optional `wandb.entity`.
+- `nanovvm_video_pred/train.py`: the scheduler is built after the loader, with
+  `steps_per_epoch = len(loader) // gradient_accumulation_steps`. A linear or cosine
+  schedule therefore works for this task; before this change it failed. `clip_grad` is
+  applied, the metrics above are logged, and the resolved config is passed to W&B.
+
+### Launch
+
+```bash
+CONFIG=configs/training/nanovvm_video_pred/scaling-ladder/tiny/vrae_eupe_mix5_tiny_xpred_interval3_cond1gen16_bs64_lr2e-4_wd0_ep1.yaml
+python -m vrae.training.nanovvm_video_pred.train --config $CONFIG --build-only
+python -m vrae.training.nanovvm_video_pred.check --config $CONFIG --paths configs/paths.local.yaml
+
+# Once for all six sizes: the shared future-latent statistics.
+torchrun --standalone --nproc_per_node=8 -m vrae.training.nanovvm_video_pred.latent_stats \
+  --config $CONFIG --paths configs/paths.local.yaml
+
+torchrun --standalone --nproc_per_node=8 -m vrae.training.nanovvm_video_pred.train \
+  --config $CONFIG --paths configs/paths.local.yaml
+```
+
+The trainer fits the statistics file when it is missing. Fit it once before starting
+several sizes at the same time, so that the runs do not all fit and write the same file.
+With 8 processes, the global batch of 64 with accumulation 4 is a micro-batch of 2 per
+GPU. To resume, use a config that includes the size file and sets `training.resume` to
+`ckpts/nanovvm_video_pred/<run_name>/checkpoints/latest.pt`. The LR schedule, data
+position and W&B run all continue from the checkpoint.
+
+### Differences Kept on Purpose
+
+- **No FVD in the training loop.** NanoVVM evaluates `fvd.interval: 10000` on val and
+  train_eval with I3D, VideoMAEv2 and V-JEPA2.1. Here, val sampling (`sample --split val`)
+  saves prediction/target pairs for external metrics.
+- **Objective.** V-RAE uses x-prediction flow matching with first-frame condition dropout
+  `dit.frame_dropout: 0.1` and classifier-free guidance. NanoVVM uses autoregressive
+  v-prediction with an L1 loss. `frame_dropout` is a model setting, not data augmentation,
+  and keeps its default.
+- **EMA.** NanoVVM's `scripts/slurm/job.sh` exports `DISABLE_EMA=1`, and its FVD uses
+  `use_ema: false`. V-RAE keeps EMA at 0.9995 and samples with it.
+- **Checkpoint pruning.** NanoVVM keeps the last 10 checkpoints (`keep_last: 10`). V-RAE
+  never prunes. One epoch writes 66 checkpoints: 65 at the 5000-step interval and the
+  final one at step 327,791. Each holds about 16 bytes per DiT parameter (weights, EMA,
+  AdamW m and v):
+
+| size | per checkpoint | 66 checkpoints |
+| --- | --- | --- |
+| tiny | 0.15 GB | 10 GB |
+| small | 1.3 GB | 84 GB |
+| medium | 4.2 GB | 277 GB |
+| large | 10.0 GB | 663 GB |
+| xl | 19.5 GB | 1.29 TB |
+| xxl | 34.2 GB | 2.26 TB |
+
 ## Tests
 
 ```bash
-PYTHONPATH=src python -m unittest tests.test_nanovvm_video_pred -v
+PYTHONPATH=src python -m unittest tests.test_nanovvm_video_pred tests.test_nanovvm_scaling_ladder -v
 ```
 
 The tests run on CPU with synthetic videos and small weights. They cover:
@@ -227,10 +391,20 @@ The tests run on CPU with synthetic videos and small weights. They cover:
 - the single-image encoder entry, and that the condition and target encodings do not
   depend on each other;
 - the DiT: condition dropout, spatial alignment, CFG, and gradients;
-- sampling from a first frame alone, and a train/resume/sample round trip;
-- a Cityscapes regression check.
+- sampling from a first frame alone, and a train/resume/sample round trip with the
+  ladder's training block (cosine with ratios, `clip_grad`, accumulation 4). The round trip
+  checks that the LR continues the schedule after resume and that W&B receives exactly the
+  NanoVVM-named keys;
+- a Cityscapes regression check;
+- for the scaling ladder (`test_nanovvm_scaling_ladder.py`):
+  - the ratio LR at every step against values from NanoVVM's scheduler;
+  - rejection of mixed ratio and step keys, and unchanged step/epoch schedules;
+  - clipping and the returned pre-clip norm, and the training-metric formulas;
+  - the `wandb.init` arguments;
+  - the exact preprocessing equality with NanoVVM;
+  - each ladder config against the size table and the recipe.
 
-The repository's `.gitignore` excludes `/tests/`, so this file was added with `git add -f`.
+The repository's `.gitignore` excludes `/tests/`, so these files were added with `git add -f`.
 
 ## Code
 
@@ -258,7 +432,8 @@ and its checkpoints are not affected.
 - Loading the 18 mix5 train manifests (about 21M clips) takes about a minute and a few
   GB of memory per rank, as in NanoVVM.
 - The default DiT has about 843M parameters. A training checkpoint with EMA and AdamW
-  state is about 13.5 GB, and old checkpoints are not pruned.
+  state is about 13.5 GB, and old checkpoints are not pruned (see the ladder's
+  checkpoint sizes above).
 - The encoder AdaLN condition is per token. This costs more than one shared condition
   vector per sample.
 - There is no FVD protocol for this task yet. Val sampling saves prediction/target pairs

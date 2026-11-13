@@ -35,6 +35,9 @@ def validate_wandb_config(config: Mapping[str, Any]) -> None:
         raise ValueError("W&B log_interval and sample_interval must be positive")
     if str(config["resume"]) not in {"allow", "must", "never", "auto"}:
         raise ValueError("W&B resume must be allow, must, never, or auto")
+    entity = config.get("entity")
+    if entity is not None and (not isinstance(entity, str) or not entity.strip()):
+        raise ValueError("W&B entity must be a non-empty string when set")
 
 
 def _api_key_source(wandb_module: Any) -> str | None:
@@ -99,6 +102,10 @@ class WandbLogger:
             "dir": run_dir,
             "id": run_id,
         }
+        # Optional; without it wandb.init receives no entity and uses the login default.
+        # Read from the config only, never from the environment.
+        if config.get("entity") is not None:
+            init_kwargs["entity"] = str(config["entity"])
         if run_config is not None:
             init_kwargs["config"] = dict(run_config)
         start_new_on_resume = os.environ.get("WANDB_START_NEW_RUN_ON_RESUME", "").lower() in {

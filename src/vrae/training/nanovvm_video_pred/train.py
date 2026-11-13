@@ -20,7 +20,7 @@ from torch.nn.parallel import DistributedDataParallel
 from vrae.config import load_config
 from vrae.paths import ProjectPaths, find_project_root, load_project_paths
 from vrae.registry import DIT_MODELS, register_builtin_models
-from vrae.training.common.accumulation import GradientAccumulator, optimizer_step
+from vrae.training.common.accumulation import GradientAccumulator, clip_and_step
 from vrae.training.common.checkpoint import (
     build_training_checkpoint,
     load_model_init,
@@ -45,7 +45,13 @@ from vrae.training.common.engine import (
     seed_everything,
 )
 from vrae.training.common.latent_norm import LatentNormalizer
-from vrae.training.common.optim import build_optimizer, build_scheduler
+from vrae.training.common.optim import (
+    build_optimizer,
+    build_scheduler,
+    resolve_scheduler_steps,
+    uses_ratio_schedule,
+    validate_ratio_schedule,
+)
 from vrae.training.common.precision import PrecisionPolicy
 from vrae.training.common.visualization import comparison_video, save_sample_tensors
 from vrae.training.common.wandb import WandbLogger
@@ -123,6 +129,22 @@ def task_geometry(config: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def validate_training_recipe(training: Mapping[str, Any]) -> None:
+    """Checks that need no data: the ratio schedule's bounds and the clipping norm."""
+
+    scheduler = training.get("scheduler", {})
+    if uses_ratio_schedule(scheduler):
+        validate_ratio_schedule(
+            scheduler, peak_lr=float(training.get("optimizer", {}).get("lr", 1.0e-4))
+        )
+        epochs = training.get("epochs", 1)
+        if isinstance(epochs, bool) or not isinstance(epochs, int) or epochs <= 0:
+            raise ValueError("training.epochs must be a positive integer")
+    clip_grad = training.get("clip_grad")
+    if clip_grad is not None and not float(clip_grad) > 0:
+        raise ValueError("training.clip_grad must be positive (or null for no clipping)")
+
+
 def validate_build(config: Mapping[str, Any]) -> dict[str, Any]:
     """Static checks and the shape contract; reads no files (see check_data for paths)."""
 
@@ -169,6 +191,7 @@ def validate_build(config: Mapping[str, Any]) -> dict[str, Any]:
     for key in ("grid_size", "input_size", "height", "width"):
         if key in dit:
             raise ValueError(f"dit.{key} is derived from the encoder grid; remove it")
+    validate_training_recipe(config["training"])
     transport = flow_transport_metadata(config)
     if transport["prediction"] != "x":
         raise ValueError("NanoVVM future prediction uses x-prediction")
@@ -321,16 +344,104 @@ def prepare_nanovvm_latents(
     return encode_condition_and_future(stage1, condition, future)
 
 
-def scalar_loss_metrics(losses: Mapping[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-    return {
-        name: value
-        for name, value in losses.items()
-        if name.startswith("loss") and value.numel() == 1
-    }
-
-
 def rgb_unit(video: torch.Tensor) -> torch.Tensor:
     return video.float().div(255.0) if video.dtype == torch.uint8 else video.float()
+
+
+# NanoVVM metric names (nanovvm docs/wandb_metrics.md) for this trainer's loss terms.
+LOSS_TERMS = ("loss", "loss_full", "loss_base")
+LOSS_METRICS = {
+    "loss": "loss/train",
+    "loss_full": "loss/train_full",
+    "loss_base": "loss/train_base",
+}
+
+
+class TrainMetrics:
+    """NanoVVM's running training metrics, kept on the device between log steps.
+
+    A step's loss is the mean of its accumulation micro-batch losses, and ``loss/train``
+    is the mean of the step losses since the previous log, averaged over ranks. The
+    gradient statistics are window means of the pre-clip total norm, its RMS over the
+    gradient elements, and ``clip_grad / max(norm, clip_grad)``. ``loss/train_epoch`` is
+    the mean micro-batch loss of the epoch. ``log_values`` and ``end_epoch`` are
+    collectives: every rank calls them at the same steps.
+    """
+
+    def __init__(self, device: torch.device, accumulation_steps: int) -> None:
+        self.accumulation_steps = int(accumulation_steps)
+        self._step = torch.zeros(len(LOSS_TERMS), dtype=torch.float64, device=device)
+        self._window = torch.zeros_like(self._step)
+        self._epoch = torch.zeros_like(self._step)
+        self._grad = torch.zeros(3, dtype=torch.float64, device=device)
+        self.window_steps = 0
+        self.grad_steps = 0
+        self.epoch_batches = 0
+
+    def add_microbatch(self, losses: Mapping[str, torch.Tensor]) -> None:
+        values = torch.stack([losses[name].detach().reshape(()) for name in LOSS_TERMS])
+        self._step += values.double()
+        self._epoch += values.double()
+        self.epoch_batches += 1
+
+    def end_step(
+        self,
+        *,
+        stepped: bool,
+        grad_norm: torch.Tensor | None,
+        grad_numel: int,
+        clip_grad: float | None,
+    ) -> None:
+        if stepped:
+            self._window += self._step / self.accumulation_steps
+            self.window_steps += 1
+            if grad_norm is not None and clip_grad:
+                norm = grad_norm.detach().double().reshape(())
+                self._grad += torch.stack(
+                    (
+                        norm,
+                        norm / math.sqrt(max(int(grad_numel), 1)),
+                        float(clip_grad) / norm.clamp(min=float(clip_grad)),
+                    )
+                )
+                self.grad_steps += 1
+        self._step.zero_()
+
+    def log_values(self, *, clip_grad: float | None) -> dict[str, float]:
+        losses = (reduce_mean(self._window) / max(self.window_steps, 1)).tolist()
+        values = {LOSS_METRICS[name]: value for name, value in zip(LOSS_TERMS, losses)}
+        if clip_grad:
+            # Gradients are identical on every rank after the DDP all-reduce.
+            grad = (self._grad / max(self.grad_steps, 1)).tolist()
+            values["optimizer/grad_norm"] = grad[0]
+            values["optimizer/grad_rms"] = grad[1]
+            values["optimizer/grad_clip_scale"] = grad[2]
+        self._window.zero_()
+        self._grad.zero_()
+        self.window_steps = 0
+        self.grad_steps = 0
+        return values
+
+    def end_epoch(self) -> dict[str, float] | None:
+        batches = self.epoch_batches
+        total = float(reduce_mean(self._epoch[0]).item())
+        self._epoch.zero_()
+        self.epoch_batches = 0
+        if batches == 0:
+            return None
+        return {"loss/train_epoch": total / batches}
+
+
+@torch.no_grad()
+def parameter_metrics(module: nn.Module) -> dict[str, float]:
+    """L2 norm and RMS over the trainable parameters (NanoVVM ``parameters/*``)."""
+
+    parameters = [parameter for parameter in module.parameters() if parameter.requires_grad]
+    norm = torch.linalg.vector_norm(
+        torch.stack([torch.linalg.vector_norm(p.detach().float()) for p in parameters])
+    ).item()
+    numel = sum(parameter.numel() for parameter in parameters)
+    return {"parameters/norm": norm, "parameters/rms": norm / math.sqrt(max(numel, 1))}
 
 
 def _checkpoint_payload(
@@ -390,7 +501,6 @@ def train(
     )
     model_metadata = nanovvm_model_metadata(config, stage1_metadata, dit, normalizer)
     optimizer = build_optimizer(dit.parameters(), config["training"]["optimizer"])
-    scheduler = build_scheduler(optimizer, config["training"]["scheduler"])
     ema = ExponentialMovingAverage(dit, decay=float(config["training"]["ema"]["decay"]))
     precision = PrecisionPolicy(
         str(config["training"].get("precision", "bf16")), distributed.device.type
@@ -413,14 +523,47 @@ def train(
     accumulation = GradientAccumulator(
         int(config["training"].get("gradient_accumulation_steps", 1))
     )
+    # Built here, before any resume: the loader is fresh, so len(loader) is a full epoch.
+    epochs = int(config["training"].get("epochs", 1))
+    steps_per_epoch = len(loader) // accumulation.steps
+    schedule_steps = resolve_scheduler_steps(
+        config["training"]["scheduler"],
+        peak_lr=float(optimizer.param_groups[0]["lr"]),
+        steps_per_epoch=steps_per_epoch,
+        epochs=epochs,
+    )
+    scheduler = build_scheduler(
+        optimizer,
+        config["training"]["scheduler"],
+        steps_per_epoch=steps_per_epoch,
+        epochs=epochs,
+    )
+    lr_schedule = {
+        "name": schedule_steps["name"],
+        "steps_per_epoch": steps_per_epoch,
+        "epochs": epochs,
+        "total_steps": epochs * steps_per_epoch,
+        "warmup_steps": schedule_steps["warmup_steps"],
+        "decay_end_steps": schedule_steps["decay_end_steps"],
+        "peak_lr": schedule_steps["peak_lr"],
+        "final_lr": schedule_steps["final_lr"],
+        "warmup_from_zero": schedule_steps["warmup_from_zero"],
+    }
     batch_contract = resolve_batch_contract(config["training"], world_size=distributed.world_size)
     if distributed.is_main:
+        print(
+            "[schedule] "
+            + ", ".join(f"{name}={value}" for name, value in lr_schedule.items()),
+            flush=True,
+        )
         update_run_metadata(
             run,
             {
                 "world_size": distributed.world_size,
                 "local_micro_batch_size": batch_contract.local_micro_batch_size,
                 "global_micro_batch_size": batch_contract.global_micro_batch_size,
+                "steps_per_epoch": steps_per_epoch,
+                "lr_schedule": lr_schedule,
                 "train_sources": dataset.identity(),
             },
         )
@@ -433,6 +576,7 @@ def train(
         run_dir=str(run / "wandb"),
         run_id=wandb_run_id,
         exact_resume=bool(config["training"].get("resume")),
+        run_config=config,
     )
 
     start_epoch = 0
@@ -471,9 +615,11 @@ def train(
     checkpoint_interval = int(config["training"].get("checkpoint_interval", 1000))
     log_interval = int(config["wandb"]["log_interval"])
     sample_interval = int(config["wandb"]["sample_interval"])
+    clip_grad = config["training"].get("clip_grad")
+    metrics = TrainMetrics(distributed.device, accumulation.steps)
     last_saved_step = step
     stop = False
-    for epoch in range(start_epoch, int(config["training"].get("epochs", 1))):
+    for epoch in range(start_epoch, epochs):
         for batch in loader:
             if accumulation.is_first_microstep:
                 optimizer.zero_grad(set_to_none=True)
@@ -487,34 +633,43 @@ def train(
                     losses = transport.training_losses(model, future, frame_features)
                     loss = losses["loss"]
                 accumulation.backward(loss, scaler)
+            metrics.add_microbatch(losses)
             sampler.commit_batch()
             if not accumulation.advance():
                 continue
-            if not optimizer_step(optimizer, scaler=scaler):
+            stepped, grad_norm = clip_and_step(
+                optimizer,
+                scaler=scaler,
+                max_grad_norm=clip_grad,
+                parameters=dit.parameters(),
+            )
+            metrics.end_step(
+                stepped=stepped,
+                grad_norm=grad_norm,
+                grad_numel=sum(p.numel() for p in dit.parameters() if p.grad is not None),
+                clip_grad=clip_grad,
+            )
+            if not stepped:
                 continue
             scheduler.step()
             ema.update(dit)
             step += 1
-            reduced_losses = None
             if step % log_interval == 0:
-                reduced_losses = {
-                    name: reduce_mean(value.detach())
-                    for name, value in scalar_loss_metrics(losses).items()
-                }
-            if distributed.is_main and reduced_losses is not None:
-                values = {name: float(value.item()) for name, value in reduced_losses.items()}
-                print(
-                    json.dumps({"task": TASK, "epoch": epoch, "step": step, **values}), flush=True
-                )
-                logger.log(
-                    {
-                        **{f"train/{name}": value for name, value in values.items()},
-                        "train/epoch": epoch,
-                        "train/learning_rate": optimizer.param_groups[0]["lr"],
-                        "train/global_batch_size": batch_contract.global_batch_size,
-                    },
-                    step=step,
-                )
+                values = metrics.log_values(clip_grad=clip_grad)
+                if distributed.is_main:
+                    values.update(parameter_metrics(dit))
+                    values.update(
+                        {
+                            "optimizer/lr": optimizer.param_groups[0]["lr"],
+                            "train/epoch": epoch,
+                            "train/global_batch_size": batch_contract.global_batch_size,
+                        }
+                    )
+                    print(
+                        json.dumps({"task": TASK, "epoch": epoch, "step": step, **values}),
+                        flush=True,
+                    )
+                    logger.log(values, step=step)
             if distributed.is_main and step % sample_interval == 0:
                 from vrae.training.nanovvm_video_pred.sample import (
                     decode_future_tokens,
@@ -595,6 +750,13 @@ def train(
             if max_steps is not None and step >= int(max_steps):
                 stop = True
                 break
+        epoch_values = metrics.end_epoch()
+        if distributed.is_main and epoch_values is not None:
+            print(
+                json.dumps({"task": TASK, "epoch": epoch, "step": step, **epoch_values}),
+                flush=True,
+            )
+            logger.log(epoch_values, step=step)
         if stop:
             break
     if step > 0 and step != last_saved_step:
@@ -641,12 +803,15 @@ if __name__ == "__main__":
 
 
 __all__ = [
+    "TrainMetrics",
     "build_nanovvm_dit",
     "ensure_latent_stats",
     "load_task_normalizer",
     "nanovvm_model_metadata",
+    "parameter_metrics",
     "prepare_nanovvm_latents",
     "task_geometry",
     "train",
     "validate_build",
+    "validate_training_recipe",
 ]

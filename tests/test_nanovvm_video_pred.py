@@ -10,6 +10,7 @@ import copy
 import hashlib
 import importlib.util
 import json
+import math
 import os
 import sys
 import tempfile
@@ -42,6 +43,29 @@ from vrae.training.nanovvm_video_pred.manifest import load_clip_manifest  # noqa
 
 SPAN = 49
 EUPE_ENCODER = load_config(ROOT / "configs/models/vrae_eupe_b_k7.yaml")["model"]["encoder"]
+LADDER_TINY = (
+    ROOT
+    / "configs/training/nanovvm_video_pred/scaling-ladder/tiny"
+    / "vrae_eupe_mix5_tiny_xpred_interval3_cond1gen16_bs64_lr2e-4_wd0_ep1.yaml"
+)
+# The scalar keys of one training log line, under NanoVVM's names (nanovvm docs/wandb_metrics.md).
+TRAIN_LOG_KEYS = {
+    "loss/train",
+    "loss/train_full",
+    "loss/train_base",
+    "optimizer/lr",
+    "optimizer/grad_norm",
+    "optimizer/grad_rms",
+    "optimizer/grad_clip_scale",
+    "parameters/norm",
+    "parameters/rms",
+    "train/epoch",
+    "train/global_batch_size",
+}
+SAMPLE_LOG_KEYS = (
+    {"samples/future16_real_vs_predicted/video_000"},
+    {"samples/display17_first_frame_plus_future/video_000"},
+)
 
 
 # ---------------------------------------------------------------- helpers
@@ -120,9 +144,30 @@ class FakeVideoReader:
 
 
 @contextmanager
+def replaced_module(name: str, module: types.ModuleType):
+    """Put ``module`` at ``sys.modules[name]`` and restore only that key afterwards.
+
+    mock.patch.dict(sys.modules, ...) would also drop every module first imported inside
+    the block, e.g. torch._dynamo by optimizer.step(); importing torch._dynamo a second time
+    in this process fails (duplicate TORCH_LIBRARY registration).
+    """
+
+    missing = object()
+    previous = sys.modules.get(name, missing)
+    sys.modules[name] = module
+    try:
+        yield module
+    finally:
+        if previous is missing:
+            sys.modules.pop(name, None)
+        else:
+            sys.modules[name] = previous
+
+
+@contextmanager
 def fake_decord():
     module = types.SimpleNamespace(VideoReader=FakeVideoReader, cpu=lambda index: index)
-    with mock.patch.dict(sys.modules, {"decord": module}):
+    with replaced_module("decord", module):
         yield
 
 
@@ -266,6 +311,36 @@ def small_dit(**overrides) -> nn.Module:
     arguments = {"grid_size": (4, 4), "in_channels": 8, "frame_channels": 12, "future_chunks": 4}
     arguments.update(overrides)
     return DIT_MODELS.build(config, **arguments)
+
+
+class FakeWandbRun:
+    def __init__(self, module):
+        self.module = module
+
+    def log(self, values, step=None):
+        self.module.logs.append((step, dict(values)))
+
+    def finish(self):
+        pass
+
+
+def fake_wandb_module() -> types.ModuleType:
+    """Records wandb.init arguments and run.log calls (wandb is not installed in the test env)."""
+
+    module = types.ModuleType("wandb")
+    module.inits, module.logs = [], []
+    module.api = types.SimpleNamespace(api_key=None)
+
+    def init(**kwargs):
+        module.inits.append(kwargs)
+        return FakeWandbRun(module)
+
+    class Video:
+        def __init__(self, data, fps=4, format=None, caption=None):
+            self.shape = tuple(data.shape)
+
+    module.init, module.Video = init, Video
+    return module
 
 
 def assert_close(actual: torch.Tensor, expected: torch.Tensor, atol: float = 1e-5) -> None:
@@ -670,19 +745,49 @@ class EndToEndTest(unittest.TestCase):
         self.assertEqual(tuple(encode_first_frame(self.stage1, first[None]).shape), (1, 256, 768))
 
     def test_train_resume_and_sample(self):
-        from vrae.training.common.contracts import create_run_metadata
+        from vrae.training.common.contracts import create_run_metadata, load_run_metadata
+        from vrae.training.common.wandb import bind_wandb_run_name
         from vrae.config import save_resolved_config
         from vrae.training.nanovvm_video_pred import latent_stats, sample, train as train_module
 
+        wandb_module = fake_wandb_module()
         with (
             tempfile.TemporaryDirectory() as tmp,
             fake_decord(),
-            mock.patch.dict(os.environ, {"WANDB_MODE": "disabled"}),
+            replaced_module("wandb", wandb_module),
+            # ENTITY/PROJECT are exported for NanoVVM on this cluster; V-RAE must ignore them.
+            mock.patch.dict(
+                os.environ,
+                {"WANDB_API_KEY": "test-key", "ENTITY": "someone-else", "PROJECT": "video-gen"},
+            ),
         ):
+            os.environ.pop("WANDB_MODE", None)
             base = Path(tmp)
             root = make_data_root(base)
             paths = ProjectPaths(project_root=base, datasets={"nanovvm": root})
             config = task_config()
+            # The scaling ladder's training block (cosine with ratios, clip_grad 1, accumulation
+            # 4, AdamW, EMA) and W&B destination. CPU-only overrides: global batch 4 (micro-batch
+            # 1), fp32, no workers, and a checkpoint, log line and sample every step. 8 train
+            # clips / 4 = 2 optimizer steps: warmup round(0.02 * 2) = 0, decay end 2.
+            ladder = load_config(LADDER_TINY)
+            config["training"] = {
+                **copy.deepcopy(ladder["training"]),
+                "global_batch_size": 4,
+                "num_workers": 0,
+                "pin_memory": False,
+                "precision": "fp32",
+                "checkpoint_interval": 1,
+            }
+            config["wandb"] = bind_wandb_run_name(
+                {
+                    **copy.deepcopy(ladder["wandb"]),
+                    "log_interval": 1,
+                    "sample_interval": 1,
+                    "sample_count": 1,
+                },
+                config["run_name"],
+            )
             train_module.validate_build(config)
             loader = mock.Mock(return_value=(self.stage1, {}))
             with (
@@ -720,10 +825,133 @@ class EndToEndTest(unittest.TestCase):
                     self.assertFalse(parameter.requires_grad)
                     self.assertIsNone(parameter.grad)
 
+                # The resolved schedule is recorded, and step 1 left the LR one step into it.
+                metadata = load_run_metadata(run)
+                self.assertEqual(
+                    metadata["lr_schedule"],
+                    {
+                        "name": "cosine",
+                        "steps_per_epoch": 2,
+                        "epochs": 1,
+                        "total_steps": 2,
+                        "warmup_steps": 0,
+                        "decay_end_steps": 2,
+                        "peak_lr": 2e-4,
+                        "final_lr": 2e-5,
+                        "warmup_from_zero": True,
+                    },
+                )
+                # cosine at progress 1/2: 2e-5 + (2e-4 - 2e-5) / 2; then final_lr at step 2.
+                lr_after = {1: 1.1e-4, 2: 2e-5}
+                self.assertEqual(payload["scheduler"]["last_epoch"], 1)
+                self.assertTrue(
+                    math.isclose(
+                        payload["optimizer"]["param_groups"][0]["lr"], lr_after[1], rel_tol=1e-12
+                    )
+                )
+
+                # W&B: the ladder destination reaches wandb.init, with the run id of the run.
+                first_init = wandb_module.inits[0]
+                self.assertEqual(
+                    (
+                        first_init["entity"],
+                        first_init["project"],
+                        first_init["name"],
+                        first_init["mode"],
+                        first_init["resume"],
+                        first_init["id"],
+                    ),
+                    (
+                        "zhaosh5t5an",
+                        "nanovvm",
+                        config["run_name"],
+                        "online",
+                        "allow",
+                        metadata["wandb_run_id"],
+                    ),
+                )
+                # Exactly the NanoVVM-named keys: the training line, the two sample videos, and
+                # the epoch loss (max_steps ends the epoch loop after step 1).
+                logs = list(wandb_module.logs)
+                self.assertEqual(
+                    [(step, set(values)) for step, values in logs],
+                    [
+                        (1, TRAIN_LOG_KEYS),
+                        (1, SAMPLE_LOG_KEYS[0]),
+                        (1, SAMPLE_LOG_KEYS[1]),
+                        (1, {"loss/train_epoch"}),
+                    ],
+                )
+                values = logs[0][1]
+                self.assertTrue(math.isclose(values["optimizer/lr"], lr_after[1], rel_tol=1e-12))
+                self.assertEqual(values["train/global_batch_size"], 4)
+                self.assertTrue(
+                    math.isclose(
+                        values["loss/train"],
+                        values["loss/train_full"] + values["loss/train_base"],
+                        rel_tol=1e-6,
+                    )
+                )
+                # Pre-clip norm: the toy loss is large, so the update was clipped to norm 1.
+                grad_norm = values["optimizer/grad_norm"]
+                self.assertGreater(grad_norm, 1.0)
+                self.assertTrue(
+                    math.isclose(
+                        values["optimizer/grad_clip_scale"], 1.0 / grad_norm, rel_tol=1e-9
+                    )
+                )
+                parameter_count = sum(value.numel() for value in payload["model"].values())
+                gradient_count = round((grad_norm / values["optimizer/grad_rms"]) ** 2)
+                self.assertTrue(0 < gradient_count <= parameter_count)
+                # parameters/* describe the weights after the update, i.e. the checkpoint.
+                weight_norm = torch.linalg.vector_norm(
+                    torch.stack([value.float().norm() for value in payload["model"].values()])
+                ).item()
+                self.assertTrue(
+                    math.isclose(values["parameters/norm"], weight_norm, rel_tol=1e-5)
+                )
+                self.assertTrue(
+                    math.isclose(
+                        values["parameters/rms"],
+                        values["parameters/norm"] / math.sqrt(parameter_count),
+                        rel_tol=1e-9,
+                    )
+                )
+
                 resumed = copy.deepcopy(config)
                 resumed["training"]["resume"] = str(checkpoint.relative_to(base))
                 train_module.train(resumed, paths, run, max_steps=2)
                 self.assertTrue((run / "checkpoints" / "step-00000002.pt").is_file())
+                payload = torch.load(
+                    run / "checkpoints" / "step-00000002.pt", map_location="cpu", weights_only=False
+                )
+                # The resumed run continues the schedule: step 2 ends at final_lr.
+                self.assertEqual(payload["scheduler"]["last_epoch"], 2)
+                self.assertTrue(
+                    math.isclose(
+                        payload["optimizer"]["param_groups"][0]["lr"], lr_after[2], rel_tol=1e-12
+                    )
+                )
+                resumed_init = wandb_module.inits[1]
+                self.assertEqual(
+                    (resumed_init["id"], resumed_init["resume"]),
+                    (metadata["wandb_run_id"], "must"),
+                )
+                resumed_logs = wandb_module.logs[len(logs) :]
+                self.assertEqual(
+                    [(step, set(values)) for step, values in resumed_logs],
+                    [
+                        (2, TRAIN_LOG_KEYS),
+                        (2, SAMPLE_LOG_KEYS[0]),
+                        (2, SAMPLE_LOG_KEYS[1]),
+                        (2, {"loss/train_epoch"}),
+                    ],
+                )
+                self.assertTrue(
+                    math.isclose(
+                        resumed_logs[0][1]["optimizer/lr"], lr_after[2], rel_tol=1e-12
+                    )
+                )
 
                 stage1, dit, loaded = sample.load_sampling_stack(
                     config, paths, run / "checkpoints" / "step-00000002.pt", torch.device("cpu")
