@@ -9,6 +9,220 @@ spatial preprocessing, and the frame protocol; it is not a dependency.
 The general V-RAE setup (installation, encoder weights, path file) is in the main
 [README](README.md). This page covers only this task.
 
+## Prompt You Should Give to The Agent to Directly Run this Task
+
+Open a coding agent with shell access (for example Claude Code) at the repository
+root on your cluster login node. Replace every `<...>` field, then paste the prompt.
+It mirrors NanoVVM's own prompt, and the mix5 data is the same NanoVVM data:
+
+```text
+Run the nanovvm_video_pred scaling ladder of this repository end to end by following
+README_nanovvm_video_pred.md, "Usage" steps 1-3 and "Scaling Ladder".
+
+My settings:
+- W&B API key: <your-wandb-api-key>
+- W&B entity / project: zhaosh5t5an / nanovvm (already set in the ladder configs; V-RAE does not read ENTITY/PROJECT)
+- Storage: DATA='/home/sz128/scratch_sz128/datasets' (NanoVVM's NANOVVM_DATA), VRAE_CKPTS='/home/sz128/scratch_sz128/ckpts/V-RAE'
+- Existing weights: stage 1 '/home/sz128/scratch_sz128/models/V-RAE-Models/vrae/vrae_eupe.pt', EUPE-ViT-B '/home/sz128/projects/V-RAE-ori/ckpts/pretrained/encoders/eupe/model.pt'
+- NanoVVM checkout, for its data tools: '/home/sz128/projects/nanovvm'
+- Dataset: mix5 = BridgeDataV2 + DROID + FineART + EgoPro + Ego-Exo4D (NanoVVM README step 3, "Mixed data (mix5)")
+- Base config: configs/training/nanovvm_video_pred/scaling-ladder/tiny/vrae_eupe_mix5_tiny_xpred_interval3_cond1gen16_bs64_lr2e-4_wd0_ep1.yaml
+- Run name: 'vrae_eupe_mix5_tiny_xpred_interval3_cond1gen16_bs64_lr2e-4_wd0_ep1'
+- Config changes: 'none'
+- Compute: Slurm: account cw220, partition commons, 2 x H200 (--gres=gpu:h200:2)
+
+Do these steps in order. Skip anything that already exists. If a step fails twice, stop and ask me.
+1. Install as in README.md, "Installation" (conda env vrae). Then, on the login node, run
+   `OMP_NUM_THREADS=8 PYTHONPATH=src python -m unittest tests.test_nanovvm_video_pred tests.test_nanovvm_scaling_ladder`.
+2. Run `wandb login` with my key. Never write the key into the repository.
+3. Write configs/paths.local.yaml (git-ignored): project_root = this checkout,
+   datasets.nanovvm = $DATA, checkpoint_write_root = $VRAE_CKPTS. Runs, latent statistics and
+   checkpoints then go under $VRAE_CKPTS. Pass `--paths configs/paths.local.yaml` to every command.
+   Weights: $VRAE_CKPTS/vrae/vrae_eupe.pt
+   (`hf download Guomh0707/V-RAE-Models vrae/vrae_eupe.pt --local-dir $VRAE_CKPTS`) and
+   $VRAE_CKPTS/pretrained/encoders/eupe/model.pt (third_party/README.md, "EUPE ViT-B/16").
+   Symlink my existing weights there instead of downloading them again.
+4. Data. Run `python -m vrae.training.nanovvm_video_pred.check --config <base config>`: every
+   video root, manifest and meta.yaml it names must exist. Build missing split_val0.0001_min100
+   holdout manifests in the NanoVVM checkout, with its .venv and data_processing/split_clip_manifest.py,
+   as NanoVVM README step 3 shows. The ladder reads EgoPro from egopro448_video, so for EgoPro run
+   `(umask 077; python data_processing/split_clip_manifest.py --val-fraction 0.0001 --min-val-clips 100 $DATA/egopro448_video/manifests/{head_left,head_right,left_wrist,right_wrist}/cond1gen16_interval3)`.
+   Never download, copy or upload EgoPro or Ego-Exo4D: if either is missing, stop and ask me.
+   Then rerun check with `--load-manifests --decode 18`.
+5. Configs, next to the base config. If my config changes are 'none' and the run name equals the
+   base config's run_name, the run config is the base config. Otherwise write <run name>.yaml,
+   which includes the base config and sets run_name and my config changes (includes replace
+   lists, so write lists in full). Also write:
+   - <run name>-smoke.yaml: includes the run config and sets run_name: <run name>-smoke;
+   - <run name>-resume.yaml: includes the run config and sets training.resume:
+     ckpts/nanovvm_video_pred/<run name>/checkpoints/latest.pt.
+   Check each with `python -m vrae.training.nanovvm_video_pred.train --config <config> --build-only`,
+   and check that training.global_batch_size is divisible by GPUs x training.gradient_accumulation_steps.
+6. Train on Slurm. Write scripts/slurm/train_<run name>.slurm: job name <run name>, one node, the
+   GPUs above, 32 CPUs, 256 GB, 24 hours. It activates the env, changes to this checkout and runs
+   `torchrun --standalone --nproc_per_node=<GPUs> -m vrae.training.nanovvm_video_pred.train --config <config> --paths configs/paths.local.yaml`,
+   with <config> = the resume config if $VRAE_CKPTS/nanovvm_video_pred/<run name>/checkpoints/latest.pt
+   exists, and the run config otherwise.
+   a. Smoke test first, as a separate short job with the same GPUs: the smoke config,
+      `--max-steps 20`, WANDB_MODE=disabled. If the shared future-latent statistics file is
+      missing, this job fits it first ("Usage" step 2). Wait for it to finish and read its log.
+   b. Submit the training job with sbatch. Wait until the first training logs appear, and check
+      that they reach W&B. One epoch is 327,791 optimizer steps, likely longer than one 24-hour
+      job; each job resumes from latest.pt (a checkpoint every 5,000 steps). Give me the command
+      that queues follow-up jobs, `sbatch --dependency=singleton scripts/slurm/train_<run name>.slurm`
+      (once per extra 24 hours), but do not run it.
+7. Stop there. Do not wait for training to finish.
+
+Rules: change no model, training or evaluation code; only add configs/paths.local.yaml, the
+configs of step 5 and the Slurm script. Don't delete data, checkpoints or runs, and don't commit
+or push. A fresh run refuses to start in a run directory that already holds files; if that
+happens, stop and ask me.
+
+Report at the end: the commands you ran, the data, weight and run directories, the Slurm job IDs,
+the W&B run URL, and anything you skipped or changed.
+```
+
+To keep the API key out of the agent's transcript, run `wandb login` yourself
+first, or export `WANDB_API_KEY` before you start the agent. Then replace the
+key line with "W&B is already logged in."
+
+## Prompt for AD
+
+This version is for Adobe AI Platform (Pluto) GPU nodes in `epic-intern-pool`.
+There is no Slurm: the agent trains on the node it runs on. Storage follows NanoVVM's
+"Prompt for AD", and the mix5 data is shared with NanoVVM runs on the same node:
+
+| What | Where |
+|---|---|
+| Code: this checkout and the new configs | Sensei FS (`/sensei-fs-3/...`) |
+| uv cache, Python and venv; weights, runs, statistics, caches | node-local SSD `/mnt/localssd/<user>/vrae`, erased when the job stops |
+| mix5 data | NanoVVM's data directory on the node, `/mnt/localssd/<user>/nanovvm/data` |
+| Durable copies of the env, data, weights and runs | `s3://phidias/<user>/checkpoint/` |
+
+Get a node first (P2 only, `request_node.sh --name auto` from the `aip-node` skill),
+open the agent on that node at the repository root, replace every `<...>` field, then
+paste the prompt:
+
+```text
+Run the nanovvm_video_pred scaling ladder of this repository (the checkout you are in, on Sensei FS)
+end to end on this Adobe AI Platform node by following README_nanovvm_video_pred.md, "Usage"
+steps 1-3 and "Scaling Ladder", adapted as below. There is no Slurm.
+
+My settings:
+- W&B API key: <your-wandb-api-key>
+- W&B entity / project: zhaosh5t5an / nanovvm (already set in the ladder configs; V-RAE does not read ENTITY/PROJECT)
+- Local root: LOCAL=/mnt/localssd/yidongh/vrae
+- Data root: DATA=/mnt/localssd/yidongh/nanovvm/data (NanoVVM's NANOVVM_DATA on this node)
+- S3 root: S3=s3://phidias/yidongh/checkpoint (mix5 data in $S3/assets/nanovvm, V-RAE env, weights and statistics in $S3/assets/vrae, runs in $S3/runs/vrae)
+- NanoVVM checkout, for its data tools: /sensei-fs-3/users/yidongh/yf/stzhao/nanovvm
+- Dataset: mix5 = BridgeDataV2 + DROID + FineART + EgoPro + Ego-Exo4D (NanoVVM README step 3, "Mixed data (mix5)")
+- Base config: configs/training/nanovvm_video_pred/scaling-ladder/tiny/vrae_eupe_mix5_tiny_xpred_interval3_cond1gen16_bs64_lr2e-4_wd0_ep1.yaml
+- Run name: vrae_eupe_mix5_tiny_xpred_interval3_cond1gen16_bs64_lr2e-4_wd0_ep1
+- Config changes: none
+- Compute: this node, A100 80 GB, 4 GPUs (NPROC_PER_NODE = count from `nvidia-smi -L`), P2, preemptible
+
+Storage rules:
+- The repository on Sensei FS holds code only. Write nothing into it except the new configs:
+  no venv, egg-info, paths file, data, weights, runs, wandb/, __pycache__ or other caches.
+- Everything large goes under $LOCAL or $DATA on the node SSD, which is erased when the job
+  stops. Durable copies go to $S3.
+- Reach S3 only through this wrapper, which uses the node's own EC2 role:
+    s5() { env -u AWS_ROLE_ARN -u AWS_WEB_IDENTITY_TOKEN_FILE -u AWS_ACCESS_KEY_ID \
+             -u AWS_SECRET_ACCESS_KEY -u AWS_SESSION_TOKEN -u AWS_PROFILE \
+             AWS_DEFAULT_REGION=us-west-2 s5cmd "$@"; }
+  phidias is shared by about 140 users. Touch only s3://phidias/yidongh/, use only
+  ls, du, cat, cp, pipe and sync, and never rm, mv or sync --delete.
+
+Do these steps in order. Skip anything that already exists. If a step fails twice, stop and ask me.
+0. Check the node: `nvidia-smi -L` lists GPUs, `s5 ls $S3/` works, and `df -h /mnt/localssd`
+   has room for the mix5 data (about 4.5 TB, unless $DATA already holds it) plus the
+   checkpoints. V-RAE never prunes checkpoints, and one epoch writes 66 of them
+   (README_nanovvm_video_pred.md, "Differences Kept on Purpose": 10 GB in total for tiny).
+   If this host has no GPUs, stop and ask me for a node. Never create, stop or change AI
+   Platform jobs.
+1. Write $LOCAL/env.sh and source it in every shell, including the training session.
+   $HOME is on the container root file system, so do not use ~/.bashrc. It sets:
+     UV_CACHE_DIR=$LOCAL/uv/cache UV_PYTHON_INSTALL_DIR=$LOCAL/uv/python VENV=$LOCAL/uv/venv
+     PYTHONPATH=<this checkout>/src PYTHONPYCACHEPREFIX=$LOCAL/cache/pycache
+     HF_HOME=$LOCAL/hf_home TORCH_HOME=$LOCAL/torch_home TMPDIR=$LOCAL/tmp
+     TRITON_CACHE_DIR=$LOCAL/cache/triton TORCHINDUCTOR_CACHE_DIR=$LOCAL/cache/inductor
+   plus LOCAL, DATA, S3, WANDB_API_KEY and the s5 function.
+2. Environment: if $S3/assets/vrae/uv.tar exists, restore it with
+   `s5 cat $S3/assets/vrae/uv.tar | tar -C $LOCAL -xf -`. Otherwise run
+   `uv venv $VENV --python 3.10`, `source $VENV/bin/activate` and `uv pip install -r pyproject.toml`.
+   This installs the dependencies but not the package, so nothing is written into the checkout;
+   PYTHONPATH stands in for the install. FFmpeg is not needed: this task decodes with decord.
+   With the venv active, run
+   `OMP_NUM_THREADS=8 python -m unittest tests.test_nanovvm_video_pred tests.test_nanovvm_scaling_ladder`.
+   After a fresh install, upload the env with `tar -C $LOCAL -cf - uv | s5 pipe $S3/assets/vrae/uv.tar`.
+3. Paths, data and weights.
+   a. Write $LOCAL/paths.yaml: project_root = this checkout, datasets.nanovvm = $DATA,
+      checkpoint_write_root = $LOCAL/ckpts. Pass `--paths $LOCAL/paths.yaml` to every command.
+   b. Data, one dataset at a time, for the video roots the base config names: bridgedatav2,
+      droid, fineart, egopro448 and egoexo4d. If $DATA/<dataset>_video is missing and
+      $S3/assets/nanovvm/data/<dataset>_video.tar exists, stream it in with s5 cat | tar (list
+      the tar first, so that it lands at $DATA/<dataset>_video). Otherwise fetch a public
+      dataset (bridgedatav2, droid, fineart) as in NanoVVM README step 3, "Mixed data (mix5)",
+      and upload it as one tar under that name with tar | s5 pipe. Use tar, not sync: s5cmd
+      does not keep symlinks or hard links. EgoPro and Ego-Exo4D are the exception: their
+      licenses forbid redistribution, so never download or upload them; if their tar is not
+      in $S3/assets/nanovvm/data, stop and ask me.
+   c. Run `python -m vrae.training.nanovvm_video_pred.check --config <base config>`. Build missing
+      split_val0.0001_min100 holdout manifests in the NanoVVM checkout, with this venv and
+      data_processing/split_clip_manifest.py, as NanoVVM README step 3 shows (about 3 minutes;
+      they are deterministic, so they match those on the cluster). For EgoPro, use
+      egopro448_video: `(umask 077; python data_processing/split_clip_manifest.py --val-fraction 0.0001 --min-val-clips 100 $DATA/egopro448_video/manifests/{head_left,head_right,left_wrist,right_wrist}/cond1gen16_interval3)`.
+      Then rerun check with `--load-manifests --decode 18`.
+   d. Weights: if $S3/assets/vrae/weights.tar exists, stream it into $LOCAL. Otherwise download
+      $LOCAL/ckpts/vrae/vrae_eupe.pt
+      (`hf download Guomh0707/V-RAE-Models vrae/vrae_eupe.pt --local-dir $LOCAL/ckpts`) and
+      $LOCAL/ckpts/pretrained/encoders/eupe/model.pt (third_party/README.md, "EUPE ViT-B/16"),
+      then upload them with `tar -C $LOCAL -cf - ckpts/vrae ckpts/pretrained | s5 pipe $S3/assets/vrae/weights.tar`.
+4. Configs, next to the base config in this checkout. If my config changes are 'none' and the run
+   name equals the base config's run_name, the run config is the base config. Otherwise write
+   <run name>.yaml, which includes the base config and sets run_name and my config changes
+   (includes replace lists, so write lists in full). Also write:
+   - <run name>-smoke.yaml: includes the run config and sets run_name: <run name>-smoke;
+   - <run name>-resume.yaml: includes the run config and sets training.resume:
+     ckpts/nanovvm_video_pred/<run name>/checkpoints/latest.pt.
+   Check each with `python -m vrae.training.nanovvm_video_pred.train --config <config> --build-only`.
+   Check that training.global_batch_size is divisible by NPROC_PER_NODE x
+   training.gradient_accumulation_steps. If it is not, stop and ask me.
+5. Train. The run directory is $LOCAL/ckpts/nanovvm_video_pred/<run name>, and the shared
+   future-latent statistics file is latent_normalizer.path of the config, under $LOCAL/ckpts.
+   a. Resume: if $S3/runs/vrae/<run name>/checkpoints/ holds a step-*.pt, copy that run directory
+      into the run directory, but of checkpoints/ only the newest step-*.pt, and make
+      checkpoints/latest.pt a symlink to it. If $S3/assets/vrae/latent_stats/ holds the
+      statistics file, copy it to its place.
+   b. Smoke run, unless you are resuming:
+      `WANDB_MODE=disabled torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m vrae.training.nanovvm_video_pred.train --config <smoke config> --paths $LOCAL/paths.yaml --max-steps 20`.
+      It first fits the statistics file if it is missing ("Usage" step 2). Then copy the
+      statistics file to $S3/assets/vrae/latent_stats/.
+   c. Start `torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m vrae.training.nanovvm_video_pred.train --config <config> --paths $LOCAL/paths.yaml`,
+      with <config> = the resume config if checkpoints/latest.pt exists and the run config
+      otherwise, in a detached tmux session named vrae-train (screen, or setsid nohup, if tmux
+      is missing), logging to $LOCAL/logs/<run name>.log.
+   d. Start a second detached session, vrae-sync, that every 15 minutes runs
+      `s5 sync --exclude "*latest.pt" <run dir>/ $S3/runs/vrae/<run name>/`
+      (latest.pt is a symlink; s5cmd would upload it as a second full copy).
+   Wait until the first training logs appear, they reach W&B, and the first sync has finished.
+6. Stop there. Do not wait for training to finish. A P2 node can be preempted at any time;
+   only what is on S3 survives it.
+
+Rules: change no model, training or evaluation code; only add the configs of step 4 and files
+under $LOCAL and $DATA. Don't delete data, checkpoints or runs, locally or on S3, and don't commit
+or push. A fresh run refuses to start in a run directory that already holds files; if that
+happens, stop and ask me.
+
+Report at the end: the commands you ran, the $LOCAL, $DATA and $S3 paths of the env, data,
+weights, statistics and run, the tmux sessions and process IDs, the W&B run URL, and anything
+you skipped or changed.
+```
+
+For another user, replace `yidongh` in `LOCAL`, `DATA` and `S3`. To keep the API key out
+of the agent's transcript, export `WANDB_API_KEY` before you start the agent and replace the
+key line with "W&B is already logged in; WANDB_API_KEY is exported."
+
 ## Frame Protocol
 
 A manifest record with `start_frame = s` covers source frames `[s, s+49)`. The loader
