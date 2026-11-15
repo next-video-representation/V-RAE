@@ -7,6 +7,7 @@ supervision, and the full/base flow-matching losses act on the future chunks onl
 
 from __future__ import annotations
 
+import contextlib
 import json
 import math
 import os
@@ -76,6 +77,8 @@ from vrae.training.nanovvm_video_pred.data import (
     validate_frame_protocol,
     validate_preprocessing,
 )
+from vrae.training.nanovvm_video_pred.fvd import evaluate as evaluate_fvd
+from vrae.training.nanovvm_video_pred.fvd import resolve_fvd_config, validate_fvd_section
 from vrae.training.nanovvm_video_pred.latents import encode_condition_and_future
 
 TASK = "nanovvm_video_pred"
@@ -198,6 +201,7 @@ def validate_build(config: Mapping[str, Any]) -> dict[str, Any]:
         if key in dit:
             raise ValueError(f"dit.{key} is derived from the encoder grid; remove it")
     validate_training_recipe(config["training"])
+    fvd = validate_fvd_section(config)
     transport = flow_transport_metadata(config)
     if transport["prediction"] != "x":
         raise ValueError("NanoVVM future prediction uses x-prediction")
@@ -233,6 +237,14 @@ def validate_build(config: Mapping[str, Any]) -> dict[str, Any]:
         "condition_frames": CONDITION_FRAMES,
         "train_sources": [entry["name"] for entry in train_sources],
         "val_sources": [entry["name"] for entry in val_sources],
+        "fvd": None
+        if fvd is None
+        else {
+            "interval": fvd["interval"],
+            "splits": sorted(fvd["splits"]),
+            "encoders": sorted(fvd["encoders"]),
+            "use_ema": bool(fvd.get("use_ema", False)),
+        },
     }
 
 
@@ -522,6 +534,15 @@ def train(
             print(f"[data]   {line}", flush=True)
         for line in storage_report or []:
             print(f"[storage] Remote video storage: {line}", flush=True)
+    # NanoVVM's FVD protocol every fvd.interval optimizer steps (vrae/training/nanovvm_video_pred/fvd.py);
+    # every file it will read is checked now, before training starts.
+    fvd_config = resolve_fvd_config(config, paths)
+    if fvd_config is not None and distributed.is_main:
+        print(
+            f"[fvd] every {fvd_config['interval']} steps on {sorted(fvd_config['splits'])} with "
+            f"{sorted(fvd_config['encoders'])}, {'EMA' if fvd_config.get('use_ema') else 'live'} weights",
+            flush=True,
+        )
     loader, sampler = build_nanovvm_loader(
         dataset,
         config,
@@ -777,6 +798,31 @@ def train(
                         run / "checkpoints",
                     )
                 last_saved_step = step
+            if fvd_config is not None and step % int(fvd_config["interval"]) == 0:
+                fvd_use_ema = bool(fvd_config.get("use_ema", False))
+                with ema.average_parameters(dit) if fvd_use_ema else contextlib.nullcontext():
+                    fvd_values = evaluate_fvd(
+                        config=config,
+                        paths=paths,
+                        fvd_config=fvd_config,
+                        stage1=stage1,
+                        dit=dit,
+                        normalizer=normalizer,
+                        transport=transport,
+                        autocast=precision.autocast,
+                        rank=distributed.rank,
+                        world_size=distributed.world_size,
+                        device=distributed.device,
+                        run_dir=run,
+                        step=step,
+                        model_name="ema" if fvd_use_ema else "model",
+                    )
+                if distributed.is_main and fvd_values:
+                    print(
+                        json.dumps({"task": TASK, "epoch": epoch, "step": step, **fvd_values}),
+                        flush=True,
+                    )
+                    logger.log(fvd_values, step=step)
             if max_steps is not None and step >= int(max_steps):
                 stop = True
                 break

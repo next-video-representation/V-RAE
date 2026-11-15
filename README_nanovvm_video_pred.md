@@ -33,7 +33,7 @@ My settings:
 
 Do these steps in order. Skip anything that already exists. If a step fails twice, stop and ask me.
 1. Install as in README.md, "Installation" (conda env vrae). Then, on the login node, run
-   `OMP_NUM_THREADS=8 PYTHONPATH=src python -m unittest tests.test_nanovvm_video_pred tests.test_nanovvm_scaling_ladder`.
+   `CUDA_VISIBLE_DEVICES= OMP_NUM_THREADS=8 PYTHONPATH=src python -m unittest tests.test_nanovvm_video_pred tests.test_nanovvm_scaling_ladder tests.test_nanovvm_fvd`.
 2. Run `wandb login` with my key. Never write the key into the repository.
 3. Write configs/paths.local.yaml (git-ignored): project_root = this checkout,
    datasets.nanovvm = $DATA, checkpoint_write_root = $VRAE_CKPTS. Runs, latent statistics and
@@ -41,6 +41,8 @@ Do these steps in order. Skip anything that already exists. If a step fails twic
    Weights: $VRAE_CKPTS/vrae/vrae_eupe.pt
    (`hf download Guomh0707/V-RAE-Models vrae/vrae_eupe.pt --local-dir $VRAE_CKPTS`) and
    $VRAE_CKPTS/pretrained/encoders/eupe/model.pt (third_party/README.md, "EUPE ViT-B/16").
+   FVD encoders: NanoVVM's models/fvd and models/vjepa2_1 at $VRAE_CKPTS/pretrained/fvd and
+   $VRAE_CKPTS/pretrained/vjepa2_1 ("Usage" step 5; NanoVVM's prepare_fvd_models.py makes them).
    Symlink my existing weights there instead of downloading them again.
 4. Data. Run `python -m vrae.training.nanovvm_video_pred.check --config <base config>`: every
    video root, manifest and meta.yaml it names must exist. Build missing split_val0.0001_min100
@@ -168,7 +170,7 @@ Do these steps in order. Skip anything that already exists. If a step fails twic
    This installs the dependencies but not the package, so nothing is written into the checkout;
    PYTHONPATH stands in for the install. FFmpeg is not needed: this task decodes with decord.
    With the venv active, run the CPU tests (GPUs hidden):
-   `CUDA_VISIBLE_DEVICES= OMP_NUM_THREADS=8 python -m unittest tests.test_nanovvm_video_pred tests.test_nanovvm_scaling_ladder tests.test_remote_video_storage`.
+   `CUDA_VISIBLE_DEVICES= OMP_NUM_THREADS=8 python -m unittest tests.test_nanovvm_video_pred tests.test_nanovvm_scaling_ladder tests.test_remote_video_storage tests.test_nanovvm_fvd`.
    After a fresh install, upload the env with `tar -C $LOCAL -cf - uv | s5 pipe $S3/assets/vrae/uv.tar`.
 3. Paths, weights and small assets.
    a. Write $LOCAL/paths.yaml: project_root = this checkout, datasets.nanovvm = $DATA,
@@ -177,7 +179,10 @@ Do these steps in order. Skip anything that already exists. If a step fails twic
       $LOCAL/ckpts/vrae/vrae_eupe.pt
       (`hf download Guomh0707/V-RAE-Models vrae/vrae_eupe.pt --local-dir $LOCAL/ckpts`) and
       $LOCAL/ckpts/pretrained/encoders/eupe/model.pt (third_party/README.md, "EUPE ViT-B/16"),
-      then upload them with `tar -C $LOCAL -cf - ckpts/vrae ckpts/pretrained | s5 pipe $S3/assets/vrae/weights.tar`.
+      then upload them with `tar -C $LOCAL -cf - ckpts/vrae ckpts/pretrained/encoders | s5 pipe $S3/assets/vrae/weights.tar`.
+      FVD encoders ("Usage" step 5), NanoVVM's: for <a> in fvd and vjepa2_1,
+      `s5 cat $S3/assets/nanovvm/models/<a>.tar | tar -C $LOCAL/ckpts/pretrained --strip-components=1 -xf -`
+      (if a tar is missing, stop and ask me).
    c. For each dataset tar the base config reads (configs/storage/adobe_s3.yaml maps them; $DATA/<d>_video for
       bridgedatav2, droid, fineart, egopro448, egoexo4d): if $S3/assets/nanovvm/indexes/v1/<d>_video.tar.index.sqlite
       exists, copy it to $DATA/remote_index/ with `s5 cp`. If you need a run checkpoint (step 6a), it comes later.
@@ -227,11 +232,12 @@ Do these steps in order. Skip anything that already exists. If a step fails twic
       otherwise, in a detached tmux session named vrae-train (screen, or setsid nohup, if tmux
       is missing), logging to $LOCAL/logs/<run name>.log.
    d. Start a second detached session, vrae-sync, that every 15 minutes runs
-      `s5 sync --exclude "*latest.pt" --exclude "*.tmp" --exclude "*.part" <run dir>/ $S3/runs/vrae/<run name>/`
+      `s5 sync --exclude "*latest.pt" --exclude "fvd_cache/*" --exclude "*.tmp" --exclude "*.part" <run dir>/ $S3/runs/vrae/<run name>/`
       (latest.pt is a symlink; s5cmd would upload it as a second full copy. The video cache lives outside
       the run directory and is never synced.)
    Wait until the first training logs appear, they reach W&B, and the first sync has finished.
-   Report data/wait_seconds_per_step and cache/hit_rate from the first log lines (with a shared cache,
+   The log line "[fvd] every 10000 steps ..." confirms the in-training FVD; its eval_fvd/* values reach W&B
+   at step 10000. Report data/wait_seconds_per_step and cache/hit_rate from the first log lines (with a shared cache,
    the cache/* counters are node-wide).
 7. Stop there. Do not wait for training to finish. A P2 node can be preempted at any time;
    only what is on S3 survives it. A new node starts cold: the first steps download their videos.
@@ -485,7 +491,49 @@ torchrun --standalone --nproc_per_node=8 \
   --paths configs/paths.local.yaml --max-steps 1
 ```
 
-**4. Sample.** Give one first frame and a seed: an image, or frame `S` of a video. To
+**5. FVD.** The scaling-ladder configs evaluate FVD during training with NanoVVM's protocol, the
+`fvd` section of `scaling-ladder/_mix5_common.yaml`:
+
+- **Schedule and data.** Every `fvd.interval: 10000` optimizer steps, on the val holdout of all 18
+  sources (`fvd.splits.val`, 2,204 clips) and as many train clips (`train`, the `train_eval`
+  manifests).
+- **Encoders.** I3D, VideoMAE-v2 and V-JEPA 2.1, scoring frames 1..16; frame 0 is the condition.
+- **Controls.** `ae_reconstruction` (the real future through the frozen V-RAE) and `static`
+  (frame 0 repeated, through the frozen V-RAE).
+- **W&B keys.** NanoVVM's: `eval_fvd/<split>/<encoder>/<source>` pooled and
+  `eval_fvd_<dataset>/<split>/<encoder>/<source>` per dataset, with `<source>` = `model`,
+  `ae_reconstruction` or `static`.
+- **Shared with NanoVVM.** Populations, the clip crop, the mp4 round trip, the encoder adapters
+  and the statistics are NanoVVM's code (`src/vrae/evaluation/nanovvm_fvd/`, vendored from
+  NanoVVM's `eval/`). The real-video statistics are therefore NanoVVM's, and the FVDs of the two
+  codebases are comparable.
+- **Generation.** The model samples from frame 0 with `sampling.*` (100 Euler steps). Each clip
+  gets the same noise at every checkpoint, so successive evaluations differ only by the weights.
+  Live weights are used, like NanoVVM (`fvd.use_ema: false`).
+- **Encoder weights.** NanoVVM's `models/fvd` and `models/vjepa2_1`, placed at
+  `<checkpoint root>/pretrained/fvd/` and `<checkpoint root>/pretrained/vjepa2_1/`. Their source is
+  NanoVVM's `data_processing/tools/prepare_fvd_models.py`, or
+  `s5 cat $S3/assets/nanovvm/models/<fvd|vjepa2_1>.tar | tar -C <checkpoint root>/pretrained --strip-components=1 -xf -`.
+  Training checks them, and every FVD manifest, before it starts.
+- **Outputs.** Results go to `<run>/fvd_eval/step_<step>/<split>/`: `fvd_score.json`,
+  `manifest.json`, `population.json` and the generated mp4s. Real features and control videos are
+  cached once in `<run>/fvd_cache/`; do not sync that directory.
+- **Cost.** The first evaluation also encodes the real clips and both controls with the three
+  encoders, so it is the slowest. Later ones generate and encode only the model's videos.
+- **Resume.** The `fvd` section is not part of a run's resume identity, so adding or changing it
+  does not block resuming a run.
+
+Offline, for any checkpoint (`--num-videos N` for a seeded subset, `--splits val` for one split,
+`--ema on|off` to override `fvd.use_ema`):
+
+```bash
+torchrun --standalone --nproc_per_node=2 -m vrae.training.nanovvm_video_pred.fvd \
+  --config configs/training/nanovvm_video_pred/scaling-ladder/tiny/vrae_eupe_mix5_tiny_xpred_interval3_cond1gen16_bs64_lr2e-4_wd0_ep1.yaml \
+  --paths configs/paths.local.yaml \
+  --checkpoint ckpts/nanovvm_video_pred/vrae_eupe_mix5_tiny_xpred_interval3_cond1gen16_bs64_lr2e-4_wd0_ep1/checkpoints/step-00010000.pt
+```
+
+**6. Sample.** Give one first frame and a seed: an image, or frame `S` of a video. To
 sample the val manifests instead, use `--split val`.
 
 ```bash
@@ -655,9 +703,10 @@ position and W&B run all continue from the checkpoint.
 
 ### Differences Kept on Purpose
 
-- **No FVD in the training loop.** NanoVVM evaluates `fvd.interval: 10000` on val and
-  train_eval with I3D, VideoMAEv2 and V-JEPA2.1. Here, val sampling (`sample --split val`)
-  saves prediction/target pairs for external metrics.
+- **FVD controls.** The in-training FVD is NanoVVM's protocol ("Usage" step 5). Its controls are
+  `ae_reconstruction` and `static`, both through the frozen V-RAE. NanoVVM's
+  `constant_velocity_2frame` extrapolates per-frame AE latents, which a 4-frame-chunk tokenizer
+  does not have. NanoVVM's `decode_batch_size` has no counterpart.
 - **Objective.** V-RAE uses x-prediction flow matching with first-frame condition dropout
   `dit.frame_dropout: 0.1` and classifier-free guidance. NanoVVM uses autoregressive
   v-prediction with an L1 loss. `frame_dropout` is a model setting, not data augmentation,
@@ -715,7 +764,11 @@ because the end-to-end test keeps its tiny model on the CPU. They cover:
   - the node cache: one download per video across processes, no eviction of leased files, the byte
     budget, killed producers, and failed downloads;
   - remote clips equal to local ones, prefetch that leaves the batches unchanged, the checker, and a
-    training run with workers whose log has the `cache/*` metrics.
+    training run with workers whose log has the `cache/*` metrics and whose W&B log has an in-loop FVD;
+- for FVD (`test_nanovvm_fvd.py`): the ladder's `fvd` section against NanoVVM's protocol (the
+  train_eval manifests mirror the val ones), rejected settings, resume identity, path resolution,
+  and the engine end to end with a toy encoder: NanoVVM's pooled and per-dataset keys, the 17-frame
+  mp4s, cached controls and features on a later step, the same noise per clip, and the caller's RNG.
 
 The repository's `.gitignore` excludes `/tests/`, so these files were added with `git add -f`.
 
@@ -730,6 +783,8 @@ The repository's `.gitignore` excludes `/tests/`, so these files were added with
 | `src/vrae/training/nanovvm_video_pred/train.py` | build checks, training loop, checkpoints |
 | `src/vrae/training/nanovvm_video_pred/sample.py` | sampling from a first frame or a split |
 | `src/vrae/training/nanovvm_video_pred/check.py` | data path, manifest and remote storage check |
+| `src/vrae/training/nanovvm_video_pred/fvd.py` | the FVD section's paths, the V-RAE predictor, in-training and offline FVD |
+| `src/vrae/evaluation/nanovvm_fvd/` | NanoVVM's FVD engine: `metrics.py` and `vendor/` vendored from NanoVVM's `eval/`; `fvd.py` is NanoVVM's `eval/fvd.py` with V-RAE generation and controls |
 | `src/vrae/storage/` | remote video storage, vendored from NanoVVM: tar indexes (`tar_index.py`), S3 and `file://` reads (`remote_io.py`), the node cache (`video_cache.py`), prefetch, `backend.py`; the storage file (`config.py`), loop metrics (`metrics.py`), the CLI (`remote_video.py`) |
 | `configs/storage/adobe_s3.yaml` | mix5 tars on S3 for AD nodes |
 | `src/vrae/models/dit/first_frame_prediction_dit.py` | the DiT (a subclass of `VRAEVideoDiT`) |
@@ -751,5 +806,5 @@ and its checkpoints are not affected.
   checkpoint sizes above).
 - The encoder AdaLN condition is per token. This costs more than one shared condition
   vector per sample.
-- There is no FVD protocol for this task yet. Val sampling saves prediction/target pairs
+- Besides FVD, val sampling saves prediction/target pairs
   for external metrics.

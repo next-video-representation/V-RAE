@@ -133,6 +133,9 @@ def canonical_resume_config(config: Mapping[str, Any]) -> dict[str, Any]:
     # sampler, or numerical checkpoint identity. This lets an exact run resume
     # after a safer loader/checkpoint implementation is deployed.
     result.pop("runtime", None)
+    # Evaluation settings (nanovvm_video_pred's in-training FVD) never change what is trained,
+    # so adding or changing them must not block resuming a run.
+    result.pop("fvd", None)
     data = result.get("data")
     if isinstance(data, dict) and data.get("video_backend", "auto") == "auto":
         # This project only permitted auto->TorchCodec for training; normalize

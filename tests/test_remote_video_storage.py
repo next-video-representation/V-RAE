@@ -970,9 +970,24 @@ class RemoteDataTest(StorageTestCase):
         from vrae.training.nanovvm_video_pred import latent_stats
         from vrae.training.nanovvm_video_pred import train as train_module
 
+        from tests.test_nanovvm_fvd import ToyEncoder
+        from vrae.evaluation.nanovvm_fvd import fvd as fvd_engine
+        from vrae.training.nanovvm_video_pred import fvd as fvd_task
+
         config = self.config()
         config["training"].update({"global_batch_size": 2, "num_workers": 2, "gradient_accumulation_steps": 1})
         config["wandb"].update({"mode": "online", "sample_interval": 1000})
+        # NanoVVM's FVD from the training loop, on the remote-backed val manifests (toy encoder).
+        encoder = self.tmp / "ckpts" / "fvd" / "i3d.pt"
+        encoder.parent.mkdir(parents=True)
+        encoder.write_bytes(b"toy")
+        config["fvd"] = {
+            "interval": 2, "frame_interval": 3, "seed": 42, "batch_size": 2, "image_size": 256,
+            "sample_fps": 8, "use_ema": False, "baselines": ["ae_reconstruction", "static"],
+            "drop_conditioning_frames": 1, "mp4_quality": 9,
+            "splits": {"val": {"num_videos": "all", "sources": remote_sources("val")}},
+            "encoders": {"i3d": {"checkpoint": "ckpts/fvd/i3d.pt", "batch_size": 2}},
+        }
         paths, storage = self.remote(config)
         report = nv_data.storage_preflight(
             storage, [item["root"] for item in nv_data.resolve_split_sources(config, paths, "train")], owner=True
@@ -986,6 +1001,8 @@ class RemoteDataTest(StorageTestCase):
             mock.patch.dict(os.environ, {"WANDB_API_KEY": "test-key"}),
             mock.patch.object(latent_stats, "load_frozen_stage1", loader),
             mock.patch.object(train_module, "load_frozen_stage1", loader),
+            mock.patch.object(fvd_engine, "VideoEncoder", ToyEncoder),
+            mock.patch.object(fvd_task, "weight_identity", lambda path: {"path": str(path)}),
             contextlib.redirect_stdout(output),
         ):
             os.environ.pop("WANDB_MODE", None)
@@ -1005,6 +1022,16 @@ class RemoteDataTest(StorageTestCase):
         logged = [values for _, values in wandb_module.logs if "loss/train" in values]
         self.assertTrue(logged and all("cache/requests" in values for values in logged))
         self.assertTrue((run / "checkpoints" / "step-00000002.pt").is_file())
+        fvd_logs = [(step, values) for step, values in wandb_module.logs if "eval_fvd/val/i3d/model" in values]
+        self.assertEqual([step for step, _ in fvd_logs], [2])
+        self.assertEqual(
+            set(fvd_logs[0][1]),
+            {f"{prefix}/val/i3d/{source}" for prefix in ("eval_fvd", "eval_fvd_toy")
+             for source in ("model", "ae_reconstruction", "static")},
+        )
+        self.assertIn("[fvd] every 2 steps on ['val'] with ['i3d'], live weights", text)
+        score = json.loads((run / "fvd_eval" / "step_0000002" / "val" / "fvd_score.json").read_text())
+        self.assertEqual((score["num_videos"], score["model_weights"]), (2, "model"))
         self.assertFalse((self.remote_root / "toy_video" / "data").exists())
         stats = storage.stats()
         self.assertGreater(stats["demand_requests"], 0)
