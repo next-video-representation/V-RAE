@@ -210,15 +210,13 @@ class StatefulDistributedBatchSampler(Sampler[list[int]]):
         ]
         if mismatches:
             raise ValueError("Exact-resume sampler mismatch:\n" + "\n".join(mismatches))
-        topology_changed = any(state.get(key) != expected[key] for key in topology_fields)
+        # An allowed world-size change keeps the seed, global_batch_size and
+        # global_micro_batch_size (checked above), so the global order and every remaining
+        # global micro-batch are the same; only their split across ranks differs. It can
+        # therefore resume inside an epoch as well as at its boundary.
         cursor = int(state["sampler_cursor"])
         if cursor < 0 or cursor > self.dataset_size:
             raise ValueError(f"Invalid sampler cursor: {cursor}")
-        if topology_changed and cursor != 0:
-            raise ValueError(
-                "World-size resume is only supported at an epoch boundary "
-                "(sampler_cursor must be 0)"
-            )
         if cursor % self.global_micro_batch_size:
             raise ValueError("Sampler cursor is not aligned to a global microbatch")
         if int(state.get("epoch", -1)) != int(state["sampler_epoch"]):

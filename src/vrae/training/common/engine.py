@@ -804,7 +804,7 @@ def train_class_conditional(
         ).lower() in {"1", "true", "yes", "on"}
         if context.is_main and allow_world_size_change:
             print(
-                "[resume] allowing an epoch-boundary world-size change; "
+                "[resume] allowing a world-size change (same global batches); "
                 "rank-local RNG streams will be re-seeded",
                 flush=True,
             )

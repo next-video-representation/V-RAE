@@ -984,6 +984,46 @@ class EndToEndTest(unittest.TestCase):
                     )
 
 
+class WorldSizeResumeTest(unittest.TestCase):
+    def test_mid_epoch_resume_on_fewer_gpus_keeps_the_global_batches(self):
+        from vrae.training.common.sampler import StatefulDistributedBatchSampler
+
+        def samplers(world_size):
+            # global batch 64, accumulation 4: local micro-batch 64 / (world_size * 4)
+            return [
+                StatefulDistributedBatchSampler(
+                    1000, 64 // (world_size * 4), rank=rank, world_size=world_size, seed=3,
+                    gradient_accumulation_steps=4,
+                )
+                for rank in range(world_size)
+            ]
+
+        def global_micro_batches(ranks):
+            per_rank = [list(sampler) for sampler in ranks]
+            return [sorted(sum(batches, [])) for batches in zip(*per_rank, strict=True)]
+
+        four = samplers(4)
+        iterators = [iter(sampler) for sampler in four]
+        for _ in range(8):  # two optimizer steps, then checkpoint mid-epoch
+            for sampler, iterator in zip(four, iterators):
+                next(iterator)
+                sampler.commit_batch()
+        del iterators
+        state = four[0].state_dict()
+        self.assertGreater(state["sampler_cursor"], 0)
+        expected = global_micro_batches(four)
+        two = samplers(2)
+        with self.assertRaisesRegex(ValueError, "world_size"):
+            two[0].load_state_dict(state)
+        for sampler in two:
+            sampler.load_state_dict(state, allow_world_size_change=True)
+        self.assertEqual(global_micro_batches(two), expected)
+        with self.assertRaisesRegex(ValueError, "global_micro_batch_size"):
+            StatefulDistributedBatchSampler(
+                1000, 4, rank=0, world_size=2, seed=3, gradient_accumulation_steps=4
+            ).load_state_dict(state, allow_world_size_change=True)
+
+
 class CityscapesRegressionTest(unittest.TestCase):
     def test_cityscapes_build_only_and_dit(self):
         from vrae.training.cityscapes_video_pred.train import build_cityscapes_dit, validate_build

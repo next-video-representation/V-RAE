@@ -602,6 +602,17 @@ def train(
             metadata_fields=metadata_fields,
         )
     if resume_path:
+        # Opt-in, as in the other V-RAE tasks: resume on a different GPU count. The global
+        # batches stay the same (same global micro-batch); rank-local RNG streams are re-seeded.
+        allow_world_size_change = os.environ.get(
+            "VRAE_ALLOW_WORLD_SIZE_CHANGE_ON_RESUME", ""
+        ).lower() in {"1", "true", "yes", "on"}
+        if distributed.is_main and allow_world_size_change:
+            print(
+                "[resume] allowing a world-size change (same global batches); "
+                "rank-local RNG streams will be re-seeded",
+                flush=True,
+            )
         payload = resume_training(
             paths.checkpoint(resume_path),
             model=dit,
@@ -614,6 +625,7 @@ def train(
             metadata_fields=metadata_fields,
             current_config=config,
             run_directory=run,
+            allow_world_size_change=allow_world_size_change,
         )
         accumulation.load_data_state(payload["data_state"])
         start_epoch = sampler.epoch
