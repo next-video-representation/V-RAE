@@ -1024,6 +1024,118 @@ class WorldSizeResumeTest(unittest.TestCase):
             ).load_state_dict(state, allow_world_size_change=True)
 
 
+class BatchLayoutResumeTest(unittest.TestCase):
+    def test_mid_epoch_accumulation_change_keeps_every_optimizer_step(self):
+        from vrae.training.common.sampler import StatefulDistributedBatchSampler
+
+        def ranks(world_size, accumulation):
+            return [
+                StatefulDistributedBatchSampler(
+                    1000, 64 // (world_size * accumulation), rank=rank, world_size=world_size,
+                    seed=5, gradient_accumulation_steps=accumulation,
+                )
+                for rank in range(world_size)
+            ]
+
+        def optimizer_steps(samplers):
+            accumulation = samplers[0].gradient_accumulation_steps
+            micro = [sorted(sum(batches, [])) for batches in zip(*[list(s) for s in samplers])]
+            return [sorted(sum(micro[i : i + accumulation], [])) for i in range(0, len(micro), accumulation)]
+
+        before = ranks(2, 4)
+        iterators = [iter(sampler) for sampler in before]
+        for _ in range(12):  # three optimizer steps, then checkpoint mid-epoch
+            for sampler, iterator in zip(before, iterators):
+                next(iterator)
+                sampler.commit_batch()
+        del iterators
+        state = before[0].state_dict()
+        expected = optimizer_steps(before)
+        for world_size, accumulation in ((2, 1), (4, 2)):
+            with self.subTest(world_size=world_size, accumulation=accumulation):
+                after = ranks(world_size, accumulation)
+                with self.assertRaisesRegex(ValueError, "gradient_accumulation_steps"):
+                    after[0].load_state_dict(state, allow_world_size_change=True)
+                for sampler in after:
+                    sampler.load_state_dict(state, allow_accumulation_change=True)
+                self.assertEqual(after[0].next_batch_index, state["sampler_cursor"] // (64 // accumulation))
+                self.assertEqual(optimizer_steps(after), expected)
+        with self.assertRaisesRegex(ValueError, "global_batch_size"):
+            StatefulDistributedBatchSampler(
+                1000, 16, rank=0, world_size=2, seed=5, gradient_accumulation_steps=1
+            ).load_state_dict(state, allow_accumulation_change=True)
+
+    def test_stop_file_checkpoints_and_resume_changes_accumulation(self):
+        from vrae.config import save_resolved_config
+        from vrae.training.common.contracts import load_run_metadata
+        from vrae.training.common.engine import prepare_run
+        from vrae.training.nanovvm_video_pred import latent_stats, train as train_module
+
+        stage1 = tiny_stage1()
+        wandb_module = fake_wandb_module()
+        loader = mock.Mock(return_value=(stage1, {}))
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            fake_decord(),
+            replaced_module("wandb", wandb_module),
+            mock.patch.dict(os.environ, {"WANDB_API_KEY": "test-key"}),
+            mock.patch.object(latent_stats, "load_frozen_stage1", loader),
+            mock.patch.object(train_module, "load_frozen_stage1", loader),
+        ):
+            os.environ.pop("VRAE_ALLOW_BATCH_LAYOUT_CHANGE_ON_RESUME", None)
+            base = Path(tmp)
+            root = make_data_root(base)
+            config = task_config()
+            config["training"].update({"global_batch_size": 4, "gradient_accumulation_steps": 2,
+                                       "checkpoint_interval": 1000})
+            config["wandb"].update({"mode": "online", "sample_interval": 1000})
+            paths_file = base / "paths.yaml"
+            save_resolved_config(
+                {"project_root": str(base), "datasets": {"nanovvm": str(root)},
+                 "checkpoint_write_root": str(base / "ckpts")},
+                paths_file,
+            )
+            first = base / "first.yaml"
+            save_resolved_config(config, first)
+            config, paths, run = prepare_run(first, paths_file)
+            latent_stats.compute_nanovvm_latent_stats(config, paths)
+            (run / "STOP").touch()
+            train_module.train(config, paths, run)  # stops at the first log step, step 1
+            self.assertTrue((run / "STOP.done").is_file())
+            self.assertFalse((run / "STOP").exists())
+            self.assertEqual(sorted(p.name for p in (run / "checkpoints").glob("step-*.pt")),
+                             ["step-00000001.pt"])
+
+            resumed = copy.deepcopy(config)
+            resumed["training"].update({"gradient_accumulation_steps": 1,
+                                        "resume": f"ckpts/nanovvm_video_pred/{config['run_name']}/checkpoints/step-00000001.pt"})
+            second = base / "second.yaml"
+            save_resolved_config(resumed, second)
+            with self.assertRaisesRegex(Exception, "gradient_accumulation_steps"):
+                prepare_run(second, paths_file)
+            os.environ["VRAE_ALLOW_BATCH_LAYOUT_CHANGE_ON_RESUME"] = "1"
+            try:
+                resumed, paths, run = prepare_run(second, paths_file)
+                train_module.train(resumed, paths, run, max_steps=2)
+            finally:
+                os.environ.pop("VRAE_ALLOW_BATCH_LAYOUT_CHANGE_ON_RESUME", None)
+            self.assertTrue((run / "checkpoints" / "step-00000002.pt").is_file())
+            metadata = load_run_metadata(run)
+            self.assertEqual(metadata["gradient_accumulation_steps"], 1)
+            self.assertEqual(metadata["local_micro_batch_size"], 4)
+            self.assertEqual(metadata["batch_layout_changes"],
+                             [{"step": 1, "gradient_accumulation_steps": [2, 1]}])
+            self.assertEqual(load_config(run / "resolved_config.yaml")["training"]
+                             ["gradient_accumulation_steps"], 1)
+            self.assertTrue((run / "resolved_config.accumulation2.yaml").is_file())
+            # Later resumes need no opt-in: the run now records the new split.
+            later = copy.deepcopy(resumed)
+            later["training"]["resume"] = f"ckpts/nanovvm_video_pred/{config['run_name']}/checkpoints/step-00000002.pt"
+            third = base / "third.yaml"
+            save_resolved_config(later, third)
+            prepare_run(third, paths_file)
+
+
 class CityscapesRegressionTest(unittest.TestCase):
     def test_cityscapes_build_only_and_dit(self):
         from vrae.training.cityscapes_video_pred.train import build_cityscapes_dit, validate_build

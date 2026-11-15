@@ -184,12 +184,19 @@ def _config_differences(expected: Any, actual: Any, prefix: str = "") -> list[st
 
 
 def compare_resolved_configs(
-    checkpoint_config: Mapping[str, Any], current_config: Mapping[str, Any]
+    checkpoint_config: Mapping[str, Any],
+    current_config: Mapping[str, Any],
+    *,
+    allow_accumulation_change: bool = False,
 ) -> None:
-    differences = _config_differences(
-        canonical_resume_config(checkpoint_config),
-        canonical_resume_config(current_config),
-    )
+    expected = canonical_resume_config(checkpoint_config)
+    actual = canonical_resume_config(current_config)
+    if allow_accumulation_change:
+        # The same global batch in a different number of micro-batches (opt-in on resume).
+        for config in (expected, actual):
+            if isinstance(config.get("training"), dict):
+                config["training"].pop("gradient_accumulation_steps", None)
+    differences = _config_differences(expected, actual)
     if differences:
         detail = "\n".join(differences[:32])
         raise CheckpointError(f"Exact-resume resolved_config mismatch:\n{detail}")
@@ -205,6 +212,7 @@ def validate_checkpoint_identity(
     *,
     checkpoint_path: str | Path | None = None,
     run_directory: str | Path | None = None,
+    allow_accumulation_change: bool = False,
 ) -> None:
     expected_identity = run_identity(config)
     if str(payload.get("task")) != expected_identity["task"]:
@@ -219,7 +227,9 @@ def validate_checkpoint_identity(
     resolved_config = payload.get("resolved_config")
     if not isinstance(resolved_config, Mapping):
         raise CheckpointError("Checkpoint resolved_config must be a mapping")
-    compare_resolved_configs(resolved_config, config)
+    compare_resolved_configs(
+        resolved_config, config, allow_accumulation_change=allow_accumulation_change
+    )
     if checkpoint_path is not None and run_directory is not None:
         checkpoint = Path(checkpoint_path).resolve()
         expected_parent = (Path(run_directory) / "checkpoints").resolve()

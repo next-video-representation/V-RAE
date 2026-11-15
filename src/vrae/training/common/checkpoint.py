@@ -132,6 +132,7 @@ def resume_training(
     current_config: Mapping[str, Any] | None = None,
     run_directory: str | Path | None = None,
     allow_world_size_change: bool = False,
+    allow_accumulation_change: bool = False,
 ) -> dict[str, Any]:
     payload = load_checkpoint(path)
     if current_config is not None:
@@ -140,6 +141,7 @@ def resume_training(
             current_config,
             checkpoint_path=path,
             run_directory=run_directory,
+            allow_accumulation_change=allow_accumulation_change,
         )
     compare_metadata(expected_metadata, payload["model_metadata"], metadata_fields)
     for name, target in (
@@ -159,6 +161,7 @@ def resume_training(
     validate_sampler_state(
         payload["data_state"],
         allow_world_size_change=allow_world_size_change,
+        allow_accumulation_change=allow_accumulation_change,
     )
     model.load_state_dict(payload["model"], strict=True)
     _load_nested(ema, payload["ema"], "ema")
@@ -168,6 +171,7 @@ def resume_training(
     sampler.load_state_dict(
         payload["data_state"],
         allow_world_size_change=allow_world_size_change,
+        allow_accumulation_change=allow_accumulation_change,
     )
     restore_rng_state(
         payload["rng_state"],

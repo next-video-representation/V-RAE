@@ -189,6 +189,7 @@ class StatefulDistributedBatchSampler(Sampler[list[int]]):
         state: Mapping[str, object],
         *,
         allow_world_size_change: bool = False,
+        allow_accumulation_change: bool = False,
     ) -> None:
         expected = {
             "sampler_seed": self.seed,
@@ -203,17 +204,23 @@ class StatefulDistributedBatchSampler(Sampler[list[int]]):
             "drop_last": self.drop_last,
         }
         topology_fields = {"world_size", "local_micro_batch_size"}
+        if allow_accumulation_change:
+            # Same global batch, split into a different number of micro-batches.
+            topology_fields |= {"global_micro_batch_size", "gradient_accumulation_steps"}
+        changeable = allow_world_size_change or allow_accumulation_change
         mismatches = [
             f"{key}: checkpoint={state.get(key)!r}, current={value!r}"
             for key, value in expected.items()
-            if state.get(key) != value and not (allow_world_size_change and key in topology_fields)
+            if state.get(key) != value and not (changeable and key in topology_fields)
         ]
         if mismatches:
             raise ValueError("Exact-resume sampler mismatch:\n" + "\n".join(mismatches))
         # An allowed world-size change keeps the seed, global_batch_size and
         # global_micro_batch_size (checked above), so the global order and every remaining
-        # global micro-batch are the same; only their split across ranks differs. It can
-        # therefore resume inside an epoch as well as at its boundary.
+        # global micro-batch are the same; only their split across ranks differs. An allowed
+        # accumulation change keeps the seed and global_batch_size: every remaining optimizer
+        # step consumes the same samples, in fewer or more micro-batches. Either can resume
+        # inside an epoch as well as at its boundary.
         cursor = int(state["sampler_cursor"])
         if cursor < 0 or cursor > self.dataset_size:
             raise ValueError(f"Invalid sampler cursor: {cursor}")
@@ -221,14 +228,15 @@ class StatefulDistributedBatchSampler(Sampler[list[int]]):
             raise ValueError("Sampler cursor is not aligned to a global microbatch")
         if int(state.get("epoch", -1)) != int(state["sampler_epoch"]):
             raise ValueError("Checkpoint epoch aliases disagree")
-        expected_batch_index = cursor // self.global_micro_batch_size
-        if int(state["next_batch_index"]) != expected_batch_index:
+        saved_micro_batch = int(state.get("global_micro_batch_size", self.global_micro_batch_size))
+        if int(state["next_batch_index"]) != cursor // saved_micro_batch:
             raise ValueError("Sampler next_batch_index does not match its cursor")
         generator_state = state.get("loader_generator_state")
         if not torch.is_tensor(generator_state):
             raise ValueError("Exact-resume state is missing loader_generator_state")
         microstep = int(state.get("gradient_accumulation_microstep", 0))
-        expected_microstep = int(state["next_batch_index"]) % self.gradient_accumulation_steps
+        saved_accumulation = int(state.get("gradient_accumulation_steps", self.gradient_accumulation_steps))
+        expected_microstep = int(state["next_batch_index"]) % saved_accumulation
         if microstep != expected_microstep:
             raise ValueError(
                 "Exact-resume gradient accumulation microstep does not match the sampler cursor"
@@ -239,11 +247,16 @@ class StatefulDistributedBatchSampler(Sampler[list[int]]):
         state: Mapping[str, object],
         *,
         allow_world_size_change: bool = False,
+        allow_accumulation_change: bool = False,
     ) -> None:
-        self.validate_state_dict(state, allow_world_size_change=allow_world_size_change)
+        self.validate_state_dict(
+            state,
+            allow_world_size_change=allow_world_size_change,
+            allow_accumulation_change=allow_accumulation_change,
+        )
         self.epoch = int(state["sampler_epoch"])
         self.cursor = int(state["sampler_cursor"])
-        self.next_batch_index = int(state["next_batch_index"])
+        self.next_batch_index = self.cursor // self.global_micro_batch_size
         self._pending_stops.clear()
         self.loader_generator.set_state(state["loader_generator_state"])
 

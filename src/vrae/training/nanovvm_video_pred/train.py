@@ -37,7 +37,12 @@ from vrae.training.common.contracts import (
     update_decoder_execution_metadata,
     update_run_metadata,
 )
-from vrae.training.common.distributed import gather_rng_states, initialize_distributed, reduce_mean
+from vrae.training.common.distributed import (
+    broadcast_object,
+    gather_rng_states,
+    initialize_distributed,
+    reduce_mean,
+)
 from vrae.training.common.ema import ExponentialMovingAverage
 from vrae.training.common.engine import (
     build_flow_transport,
@@ -625,13 +630,20 @@ def train(
     if resume_path:
         # Opt-in, as in the other V-RAE tasks: resume on a different GPU count. The global
         # batches stay the same (same global micro-batch); rank-local RNG streams are re-seeded.
-        allow_world_size_change = os.environ.get(
-            "VRAE_ALLOW_WORLD_SIZE_CHANGE_ON_RESUME", ""
-        ).lower() in {"1", "true", "yes", "on"}
+        def opted_in(name: str) -> bool:
+            return os.environ.get(name, "").lower() in {"1", "true", "yes", "on"}
+
+        # VRAE_ALLOW_BATCH_LAYOUT_CHANGE_ON_RESUME also allows a different number of
+        # micro-batches per optimizer step (gradient_accumulation_steps), same global batch.
+        allow_accumulation_change = opted_in("VRAE_ALLOW_BATCH_LAYOUT_CHANGE_ON_RESUME")
+        allow_world_size_change = (
+            opted_in("VRAE_ALLOW_WORLD_SIZE_CHANGE_ON_RESUME") or allow_accumulation_change
+        )
         if distributed.is_main and allow_world_size_change:
             print(
-                "[resume] allowing a world-size change (same global batches); "
-                "rank-local RNG streams will be re-seeded",
+                "[resume] allowing a world-size"
+                + (" or accumulation" if allow_accumulation_change else "")
+                + " change (same global batches); rank-local RNG streams may be re-seeded",
                 flush=True,
             )
         payload = resume_training(
@@ -647,6 +659,7 @@ def train(
             current_config=config,
             run_directory=run,
             allow_world_size_change=allow_world_size_change,
+            allow_accumulation_change=allow_accumulation_change,
         )
         accumulation.load_data_state(payload["data_state"])
         start_epoch = sampler.epoch
@@ -664,6 +677,7 @@ def train(
     cache_previous = storage.stats() if storage.remote and distributed.is_main else {}
     last_saved_step = step
     stop = False
+    stop_file = False
     for epoch in range(start_epoch, epochs):
         for batch in timed_batches(loader, data_wait):
             if accumulation.is_first_microstep:
@@ -823,6 +837,15 @@ def train(
                         flush=True,
                     )
                     logger.log(fvd_values, step=step)
+            # Graceful stop: `touch <run>/STOP` checkpoints this step and exits (no lost steps).
+            if step % log_interval == 0 and broadcast_object(
+                (run / "STOP").exists() if distributed.is_main else None
+            ):
+                if distributed.is_main:
+                    print(f"[stop] {run / 'STOP'} found at step {step}; checkpointing and exiting", flush=True)
+                stop_file = True
+                stop = True
+                break
             if max_steps is not None and step >= int(max_steps):
                 stop = True
                 break
@@ -855,6 +878,9 @@ def train(
                 ),
                 run / "checkpoints",
             )
+    if stop_file and distributed.is_main:
+        (run / "STOP").replace(run / "STOP.done")
+        print(f"[stop] checkpoint of step {step} saved; exiting", flush=True)
     if sampler.prefetcher is not None:
         sampler.prefetcher.close()
     if storage.remote:

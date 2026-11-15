@@ -13,7 +13,10 @@
 #
 # ${NAME:-default} is expanded from the environment. The cache format is NanoVVM's: point
 # VRAE_VIDEO_CACHE at NanoVVM's cache (NANOVVM_VIDEO_CACHE) to share one budget on a node, with the same
-# capacity and reserve in both.
+# capacity and reserve in both. The download limits are enforced against node-wide counts, so every
+# process sharing the cache (NanoVVM's too) must use the same VRAE_VIDEO_CACHE_MAX_DOWNLOADS /
+# VRAE_PREFETCH_* values: a process with lower limits than the others waits for a download slot and
+# fails after wait_timeout_seconds. The defaults are NanoVVM's.
 storage:
   backend: remote
   s3:
@@ -45,11 +48,11 @@ storage:
     dir: ${VRAE_VIDEO_CACHE:-/mnt/localssd/${USER:-vrae}/vrae/video_cache}
     capacity_gib: ${VRAE_VIDEO_CACHE_GIB:-300}           # one budget for the whole node
     reserve_gib: ${VRAE_VIDEO_CACHE_RESERVE_GIB:-100}    # kept free for env, weights, runs
-    max_downloads: 32
+    max_downloads: ${VRAE_VIDEO_CACHE_MAX_DOWNLOADS:-32}    # node-wide concurrent downloads
     wait_timeout_seconds: 900
   prefetch:
     enabled: true
-    depth: 128          # samples per rank looked ahead (the DataLoader already reads ~num_workers*prefetch_factor batches ahead)
-    workers: 4          # download threads per rank
-    max_downloads: 16
-    max_reserved_gib: 32
+    depth: ${VRAE_PREFETCH_DEPTH:-128}          # samples per rank looked ahead (the DataLoader already reads ~num_workers*prefetch_factor batches ahead)
+    workers: ${VRAE_PREFETCH_WORKERS:-4}          # download threads per rank
+    max_downloads: ${VRAE_PREFETCH_MAX_DOWNLOADS:-16}
+    max_reserved_gib: ${VRAE_PREFETCH_MAX_RESERVED_GIB:-32}

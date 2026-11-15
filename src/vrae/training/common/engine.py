@@ -179,6 +179,11 @@ def prepare_run(
             from vrae.checkpoint import CheckpointError, load_checkpoint
 
             resume_value = config.get("training", {}).get("resume")
+            # Opt-in: resume with the same global batch split into a different number of
+            # micro-batches (gradient_accumulation_steps) and/or GPUs.
+            allow_accumulation_change = os.environ.get(
+                "VRAE_ALLOW_BATCH_LAYOUT_CHANGE_ON_RESUME", ""
+            ).lower() in {"1", "true", "yes", "on"}
             if resume_value:
                 if not run.is_dir():
                     raise CheckpointError(f"Exact-resume run directory does not exist: {run}")
@@ -189,13 +194,50 @@ def prepare_run(
                     config,
                     checkpoint_path=checkpoint_path,
                     run_directory=run,
+                    allow_accumulation_change=allow_accumulation_change,
                 )
                 resolved_path = run / "resolved_config.yaml"
                 if not resolved_path.is_file():
                     raise CheckpointError("Exact-resume run is missing resolved_config.yaml")
                 previous_config = load_config(resolved_path)
-                compare_resolved_configs(previous_config, payload["resolved_config"])
-                compare_resolved_configs(previous_config, config)
+                compare_resolved_configs(
+                    previous_config,
+                    payload["resolved_config"],
+                    allow_accumulation_change=allow_accumulation_change,
+                )
+                compare_resolved_configs(
+                    previous_config, config, allow_accumulation_change=allow_accumulation_change
+                )
+                previous_steps = int(
+                    previous_config.get("training", {}).get("gradient_accumulation_steps", 1)
+                )
+                current_steps = int(config.get("training", {}).get("gradient_accumulation_steps", 1))
+                if allow_accumulation_change and previous_steps != current_steps:
+                    # Record the new split, so that later resumes compare against it.
+                    backup = run / f"resolved_config.accumulation{previous_steps}.yaml"
+                    if not backup.exists():
+                        save_resolved_config(previous_config, backup)
+                    previous_config["training"]["gradient_accumulation_steps"] = current_steps
+                    save_resolved_config(previous_config, resolved_path)
+                    history = list(load_run_metadata(run).get("batch_layout_changes", []))
+                    history.append(
+                        {
+                            "step": int(payload["step"]),
+                            "gradient_accumulation_steps": [previous_steps, current_steps],
+                        }
+                    )
+                    update_run_metadata(
+                        run,
+                        {
+                            "gradient_accumulation_steps": current_steps,
+                            "batch_layout_changes": history,
+                        },
+                    )
+                    print(
+                        f"[resume] gradient_accumulation_steps {previous_steps} -> {current_steps} "
+                        f"at step {int(payload['step'])} (same global batch)",
+                        flush=True,
+                    )
                 metadata = load_run_metadata(run)
                 if metadata.get("run_identity") != run_identity(config):
                     raise CheckpointError("run_metadata.yaml has a different run identity")
