@@ -89,15 +89,19 @@ key line with "W&B is already logged in."
 ## Prompt for AD
 
 This version is for Adobe AI Platform (Pluto) GPU nodes in `epic-intern-pool`.
-There is no Slurm: the agent trains on the node it runs on. Storage follows NanoVVM's
-"Prompt for AD", and the mix5 data is shared with NanoVVM runs on the same node:
+There is no Slurm: the agent trains on the node it runs on. Raw videos are not staged: they stay in
+uncompressed tars on S3 and are read on demand, whole video by whole video, through a bounded cache on
+the node SSD ("Remote Video Storage" below). The tars, indexes and manifests are NanoVVM's, and so is
+the cache format: V-RAE and NanoVVM runs on one node share one cache and one budget. Storage follows
+NanoVVM's "Prompt for AD":
 
 | What | Where |
 |---|---|
 | Code: this checkout and the new configs | Sensei FS (`/sensei-fs-3/...`) |
 | uv cache, Python and venv; weights, runs, statistics, caches | node-local SSD `/mnt/localssd/<user>/vrae`, erased when the job stops |
-| mix5 data | NanoVVM's data directory on the node, `/mnt/localssd/<user>/nanovvm/data` |
-| Durable copies of the env, data, weights and runs | `s3://phidias/<user>/checkpoint/` |
+| mix5 manifests and tar indexes (no videos) | NanoVVM's data directory on the node, `/mnt/localssd/<user>/nanovvm/data` |
+| Video cache (disposable, shared with NanoVVM) | `/mnt/localssd/<user>/nanovvm/video_cache` |
+| Durable copies: env, weights, statistics, runs; NanoVVM's dataset tars and indexes | `s3://phidias/<user>/checkpoint/` |
 
 Get a node first (P2 only, `request_node.sh --name auto` from the `aip-node` skill),
 open the agent on that node at the repository root, replace every `<...>` field, then
@@ -106,79 +110,98 @@ paste the prompt:
 ```text
 Run the nanovvm_video_pred scaling ladder of this repository (the checkout you are in, on Sensei FS)
 end to end on this Adobe AI Platform node by following README_nanovvm_video_pred.md, "Usage"
-steps 1-3 and "Scaling Ladder", adapted as below. There is no Slurm.
+steps 1-3 and "Scaling Ladder", adapted as below. There is no Slurm. Videos are read from S3 on demand
+through the node video cache (README_nanovvm_video_pred.md, "Remote Video Storage"); never download or
+extract whole datasets.
 
 My settings:
-- W&B API key: <your-wandb-api-key>
+- W&B: WANDB_API_KEY comes from the secrets file; never print it or write it anywhere else
 - W&B entity / project: zhaosh5t5an / nanovvm (already set in the ladder configs; V-RAE does not read ENTITY/PROJECT)
 - Local root: LOCAL=/mnt/localssd/yidongh/vrae
-- Data root: DATA=/mnt/localssd/yidongh/nanovvm/data (NanoVVM's NANOVVM_DATA on this node)
-- S3 root: S3=s3://phidias/yidongh/checkpoint (mix5 data in $S3/assets/nanovvm, V-RAE env, weights and statistics in $S3/assets/vrae, runs in $S3/runs/vrae)
+- Data root: DATA=/mnt/localssd/yidongh/nanovvm/data (NanoVVM's NANOVVM_DATA on this node: manifests and tar indexes)
+- S3 root: S3=s3://phidias/yidongh/checkpoint (mix5 tars and indexes in $S3/assets/nanovvm, V-RAE env, weights and statistics in $S3/assets/vrae, runs in $S3/runs/vrae)
 - NanoVVM checkout, for its data tools: /sensei-fs-3/users/yidongh/yf/stzhao/nanovvm
 - Dataset: mix5 = BridgeDataV2 + DROID + FineART + EgoPro + Ego-Exo4D (NanoVVM README step 3, "Mixed data (mix5)")
 - Base config: configs/training/nanovvm_video_pred/scaling-ladder/tiny/vrae_eupe_mix5_tiny_xpred_interval3_cond1gen16_bs64_lr2e-4_wd0_ep1.yaml
 - Run name: vrae_eupe_mix5_tiny_xpred_interval3_cond1gen16_bs64_lr2e-4_wd0_ep1
 - Config changes: none
+- Video storage: VRAE_STORAGE_CONFIG=configs/storage/adobe_s3.yaml, VRAE_VIDEO_CACHE=/mnt/localssd/yidongh/nanovvm/video_cache,
+  VRAE_VIDEO_CACHE_GIB=300, VRAE_VIDEO_CACHE_RESERVE_GIB=100 (the same budget as NanoVVM runs on this node)
 - Compute: this node, A100 80 GB, 4 GPUs (NPROC_PER_NODE = count from `nvidia-smi -L`), P2, preemptible
 
 Storage rules:
 - The repository on Sensei FS holds code only. Write nothing into it except the new configs:
   no venv, egg-info, paths file, data, weights, runs, wandb/, __pycache__ or other caches.
 - Everything large goes under $LOCAL or $DATA on the node SSD, which is erased when the job
-  stops. Durable copies go to $S3.
-- Reach S3 only through this wrapper, which uses the node's own EC2 role:
+  stops. Durable copies go to $S3. The video cache ($VRAE_VIDEO_CACHE) is disposable: never back it up.
+- Reach S3 from the shell only through this wrapper, which uses the node's own EC2 role:
     s5() { env -u AWS_ROLE_ARN -u AWS_WEB_IDENTITY_TOKEN_FILE -u AWS_ACCESS_KEY_ID \
              -u AWS_SECRET_ACCESS_KEY -u AWS_SESSION_TOKEN -u AWS_PROFILE \
              AWS_DEFAULT_REGION=us-west-2 s5cmd "$@"; }
-  phidias is shared by about 140 users. Touch only s3://phidias/yidongh/, use only
-  ls, du, cat, cp, pipe and sync, and never rm, mv or sync --delete.
+  (Training reads S3 the same way, through the instance role: storage.s3.credentials=instance_role.)
+  phidias is shared by about 140 users. Touch only s3://phidias/yidongh/, use only ls, du, cat, cp, pipe
+  and sync, and never rm, mv or sync --delete. New files on S3 go only to $S3/runs/vrae/<run name>/,
+  $S3/assets/vrae/ and, create-only, $S3/assets/nanovvm/indexes/v1/; never overwrite an existing asset.
+- EgoPro and Ego-Exo4D videos are licensed: never download, copy or upload them. Their tars are read from
+  $S3/assets/nanovvm only; if a tar is missing there, stop and ask me.
 
 Do these steps in order. Skip anything that already exists. If a step fails twice, stop and ask me.
-0. Check the node: `nvidia-smi -L` lists GPUs, `s5 ls $S3/` works, and `df -h /mnt/localssd`
-   has room for the mix5 data (about 4.5 TB, unless $DATA already holds it) plus the
-   checkpoints. V-RAE never prunes checkpoints, and one epoch writes 66 of them
-   (README_nanovvm_video_pred.md, "Differences Kept on Purpose": 10 GB in total for tiny).
-   If this host has no GPUs, stop and ask me for a node. Never create, stop or change AI
-   Platform jobs.
+0. Check the node: `nvidia-smi -L` lists GPUs (if none, stop and ask me for a node), `s5 ls $S3/` works,
+   and `df -h /mnt/localssd` shows at least VRAE_VIDEO_CACHE_GIB + VRAE_VIDEO_CACHE_RESERVE_GIB + 50 GB
+   free (about 450 GB with my settings; lower VRAE_VIDEO_CACHE_GIB if not, never below 50; a NanoVVM run
+   sharing the cache counts once), plus the checkpoints: V-RAE never prunes them, and one epoch writes 66
+   (README_nanovvm_video_pred.md, "Differences Kept on Purpose": 10 GB in total for tiny). Never create,
+   stop or change AI Platform jobs.
 1. Write $LOCAL/env.sh and source it in every shell, including the training session.
    $HOME is on the container root file system, so do not use ~/.bashrc. It sets:
+     PATH=$LOCAL/bin:$PATH (uv lives there: `curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=$LOCAL/bin UV_NO_MODIFY_PATH=1 sh`)
      UV_CACHE_DIR=$LOCAL/uv/cache UV_PYTHON_INSTALL_DIR=$LOCAL/uv/python VENV=$LOCAL/uv/venv
      PYTHONPATH=<this checkout>/src PYTHONPYCACHEPREFIX=$LOCAL/cache/pycache
      HF_HOME=$LOCAL/hf_home TORCH_HOME=$LOCAL/torch_home TMPDIR=$LOCAL/tmp
      TRITON_CACHE_DIR=$LOCAL/cache/triton TORCHINDUCTOR_CACHE_DIR=$LOCAL/cache/inductor
-   plus LOCAL, DATA, S3, WANDB_API_KEY and the s5 function.
+     VRAE_STORAGE_CONFIG=configs/storage/adobe_s3.yaml VRAE_VIDEO_CACHE=... VRAE_VIDEO_CACHE_GIB=... VRAE_VIDEO_CACHE_RESERVE_GIB=...
+   plus LOCAL, DATA, S3, the secrets from the secrets file, and the s5 function.
 2. Environment: if $S3/assets/vrae/uv.tar exists, restore it with
    `s5 cat $S3/assets/vrae/uv.tar | tar -C $LOCAL -xf -`. Otherwise run
-   `uv venv $VENV --python 3.10`, `source $VENV/bin/activate` and `uv pip install -r pyproject.toml`.
+   `uv venv $VENV --python 3.10`. Then `source $VENV/bin/activate` and
+   `uv pip install -r pyproject.toml --extra s3` (botocore for the S3 video backend).
    This installs the dependencies but not the package, so nothing is written into the checkout;
    PYTHONPATH stands in for the install. FFmpeg is not needed: this task decodes with decord.
-   With the venv active, run
-   `OMP_NUM_THREADS=8 python -m unittest tests.test_nanovvm_video_pred tests.test_nanovvm_scaling_ladder`.
+   With the venv active, run the CPU tests (GPUs hidden):
+   `CUDA_VISIBLE_DEVICES= OMP_NUM_THREADS=8 python -m unittest tests.test_nanovvm_video_pred tests.test_nanovvm_scaling_ladder tests.test_remote_video_storage`.
    After a fresh install, upload the env with `tar -C $LOCAL -cf - uv | s5 pipe $S3/assets/vrae/uv.tar`.
-3. Paths, data and weights.
+3. Paths, weights and small assets.
    a. Write $LOCAL/paths.yaml: project_root = this checkout, datasets.nanovvm = $DATA,
       checkpoint_write_root = $LOCAL/ckpts. Pass `--paths $LOCAL/paths.yaml` to every command.
-   b. Data, one dataset at a time, for the video roots the base config names: bridgedatav2,
-      droid, fineart, egopro448 and egoexo4d. If $DATA/<dataset>_video is missing and
-      $S3/assets/nanovvm/data/<dataset>_video.tar exists, stream it in with s5 cat | tar (list
-      the tar first, so that it lands at $DATA/<dataset>_video). Otherwise fetch a public
-      dataset (bridgedatav2, droid, fineart) as in NanoVVM README step 3, "Mixed data (mix5)",
-      and upload it as one tar under that name with tar | s5 pipe. Use tar, not sync: s5cmd
-      does not keep symlinks or hard links. EgoPro and Ego-Exo4D are the exception: their
-      licenses forbid redistribution, so never download or upload them; if their tar is not
-      in $S3/assets/nanovvm/data, stop and ask me.
-   c. Run `python -m vrae.training.nanovvm_video_pred.check --config <base config>`. Build missing
-      split_val0.0001_min100 holdout manifests in the NanoVVM checkout, with this venv and
-      data_processing/split_clip_manifest.py, as NanoVVM README step 3 shows (about 3 minutes;
-      they are deterministic, so they match those on the cluster). For EgoPro, use
-      egopro448_video: `(umask 077; python data_processing/split_clip_manifest.py --val-fraction 0.0001 --min-val-clips 100 $DATA/egopro448_video/manifests/{head_left,head_right,left_wrist,right_wrist}/cond1gen16_interval3)`.
-      Then rerun check with `--load-manifests --decode 18`.
-   d. Weights: if $S3/assets/vrae/weights.tar exists, stream it into $LOCAL. Otherwise download
+   b. Weights: if $S3/assets/vrae/weights.tar exists, stream it into $LOCAL. Otherwise download
       $LOCAL/ckpts/vrae/vrae_eupe.pt
       (`hf download Guomh0707/V-RAE-Models vrae/vrae_eupe.pt --local-dir $LOCAL/ckpts`) and
       $LOCAL/ckpts/pretrained/encoders/eupe/model.pt (third_party/README.md, "EUPE ViT-B/16"),
       then upload them with `tar -C $LOCAL -cf - ckpts/vrae ckpts/pretrained | s5 pipe $S3/assets/vrae/weights.tar`.
-4. Configs, next to the base config in this checkout. If my config changes are 'none' and the run
+   c. For each dataset tar the base config reads (configs/storage/adobe_s3.yaml maps them; $DATA/<d>_video for
+      bridgedatav2, droid, fineart, egopro448, egoexo4d): if $S3/assets/nanovvm/indexes/v1/<d>_video.tar.index.sqlite
+      exists, copy it to $DATA/remote_index/ with `s5 cp`. If you need a run checkpoint (step 6a), it comes later.
+4. Remote video sources, one dataset at a time (T="python -m vrae.storage.remote_video"):
+   a. `s5 ls $S3/assets/nanovvm/data/<d>_video.tar` must exist. For EgoPro or Ego-Exo4D, if it does not,
+      stop and ask me. For a public dataset, stop and ask me before preparing it (NanoVVM README,
+      "Prompt for AD", step 4a: a one-time download, then one uncompressed tar indexed while it uploads).
+   b. Index: if $DATA/remote_index/<d>_video.tar.index.sqlite is still missing, build it from the
+      headers of the S3 tar: `$T index --archive $S3/assets/nanovvm/data/<d>_video.tar --output
+      $DATA/remote_index/<d>_video.tar.index.sqlite` (one ranged GET per video, about 30 ms each,
+      no payloads; resumable: rerun the same command after an interruption). Then
+      `$T upload-index --index <it> --dest $S3/assets/nanovvm/indexes/v1/<d>_video.tar.index.sqlite`.
+      Check its member prefix with `$T list --index <it> --limit 5` (expected data/<d>_video/...).
+   c. Manifests: fetch only them from the tar, never the videos:
+      `$T extract --index <it> --pattern 'data/<d>_video/manifests/*' --strip-prefix data --dest $DATA`.
+      Then build the missing split_val0.0001_min100 holdout manifests in the NanoVVM checkout, with this
+      venv and data_processing/split_clip_manifest.py, as NanoVVM README step 3 shows (about 3 minutes;
+      deterministic, so they match the cluster's). For EgoPro, use egopro448_video:
+      `(umask 077; python data_processing/split_clip_manifest.py --val-fraction 0.0001 --min-val-clips 100 $DATA/egopro448_video/manifests/{head_left,head_right,left_wrist,right_wrist}/cond1gen16_interval3)`.
+   d. `python -m vrae.training.nanovvm_video_pred.check --config <base config> --paths $LOCAL/paths.yaml
+      --load-manifests --decode 18`: credentials, archive identities, the cache budget, every manifest,
+      every train and val manifest video resolved in its index, and 18 clips decoded through the cache.
+      It must end with "storage check passed".
+5. Configs, next to the base config in this checkout. If my config changes are 'none' and the run
    name equals the base config's run_name, the run config is the base config. Otherwise write
    <run name>.yaml, which includes the base config and sets run_name and my config changes
    (includes replace lists, so write lists in full). Also write:
@@ -188,7 +211,7 @@ Do these steps in order. Skip anything that already exists. If a step fails twic
    Check each with `python -m vrae.training.nanovvm_video_pred.train --config <config> --build-only`.
    Check that training.global_batch_size is divisible by NPROC_PER_NODE x
    training.gradient_accumulation_steps. If it is not, stop and ask me.
-5. Train. The run directory is $LOCAL/ckpts/nanovvm_video_pred/<run name>, and the shared
+6. Train. The run directory is $LOCAL/ckpts/nanovvm_video_pred/<run name>, and the shared
    future-latent statistics file is latent_normalizer.path of the config, under $LOCAL/ckpts.
    a. Resume: if $S3/runs/vrae/<run name>/checkpoints/ holds a step-*.pt, copy that run directory
       into the run directory, but of checkpoints/ only the newest step-*.pt, and make
@@ -196,32 +219,41 @@ Do these steps in order. Skip anything that already exists. If a step fails twic
       statistics file, copy it to its place.
    b. Smoke run, unless you are resuming:
       `WANDB_MODE=disabled torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m vrae.training.nanovvm_video_pred.train --config <smoke config> --paths $LOCAL/paths.yaml --max-steps 20`.
-      It first fits the statistics file if it is missing ("Usage" step 2). Then copy the
-      statistics file to $S3/assets/vrae/latent_stats/.
+      It first fits the statistics file if it is missing ("Usage" step 2; its 20,000 clips come through the
+      cache too). Its log must show "[storage] Remote video storage" lines and cache/* metrics. Then copy
+      the statistics file to $S3/assets/vrae/latent_stats/.
    c. Start `torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m vrae.training.nanovvm_video_pred.train --config <config> --paths $LOCAL/paths.yaml`,
       with <config> = the resume config if checkpoints/latest.pt exists and the run config
       otherwise, in a detached tmux session named vrae-train (screen, or setsid nohup, if tmux
       is missing), logging to $LOCAL/logs/<run name>.log.
    d. Start a second detached session, vrae-sync, that every 15 minutes runs
-      `s5 sync --exclude "*latest.pt" <run dir>/ $S3/runs/vrae/<run name>/`
-      (latest.pt is a symlink; s5cmd would upload it as a second full copy).
+      `s5 sync --exclude "*latest.pt" --exclude "*.tmp" --exclude "*.part" <run dir>/ $S3/runs/vrae/<run name>/`
+      (latest.pt is a symlink; s5cmd would upload it as a second full copy. The video cache lives outside
+      the run directory and is never synced.)
    Wait until the first training logs appear, they reach W&B, and the first sync has finished.
-6. Stop there. Do not wait for training to finish. A P2 node can be preempted at any time;
-   only what is on S3 survives it.
+   Report data/wait_seconds_per_step and cache/hit_rate from the first log lines (with a shared cache,
+   the cache/* counters are node-wide).
+7. Stop there. Do not wait for training to finish. A P2 node can be preempted at any time;
+   only what is on S3 survives it. A new node starts cold: the first steps download their videos.
 
-Rules: change no model, training or evaluation code; only add the configs of step 4 and files
-under $LOCAL and $DATA. Don't delete data, checkpoints or runs, locally or on S3, and don't commit
-or push. A fresh run refuses to start in a run directory that already holds files; if that
-happens, stop and ask me.
+Rules: change no model, training or evaluation code; only add the configs of step 5 and files
+under $LOCAL and $DATA (and the shared video cache). Don't delete data, checkpoints or runs, locally or
+on S3, and don't commit or push. A fresh run refuses to start in a run directory that already holds
+files; if that happens, stop and ask me.
 
-Report at the end: the commands you ran, the $LOCAL, $DATA and $S3 paths of the env, data,
-weights, statistics and run, the tmux sessions and process IDs, the W&B run URL, and anything
-you skipped or changed.
+Report at the end: the commands you ran, the $LOCAL, $DATA and $S3 paths of the env, indexes,
+manifests, weights, statistics, video cache and run, the tmux sessions and process IDs, the W&B run
+URL, and anything you skipped or changed.
 ```
 
-For another user, replace `yidongh` in `LOCAL`, `DATA` and `S3`. To keep the API key out
-of the agent's transcript, export `WANDB_API_KEY` before you start the agent and replace the
-key line with "W&B is already logged in; WANDB_API_KEY is exported."
+For another user, replace `yidongh` in the secrets file, `LOCAL`, `DATA`, `S3` and `VRAE_VIDEO_CACHE` (and set
+`VRAE_S3_ASSETS` if the NanoVVM tars live elsewhere). If you have no secrets file, run `wandb login`
+yourself, export `WANDB_API_KEY` before you start the agent, and replace the W&B line with "W&B is
+already logged in; WANDB_API_KEY is exported."
+
+To train from fully local data instead (an offline node, or to compare), restore the dataset tars into
+the data root's parent (`s5 cat $S3/assets/nanovvm/data/<d>_video.tar | tar -C /mnt/localssd/yidongh/nanovvm -xf -`,
+about 3 TB for mix5) and set `VRAE_STORAGE_CONFIG=local`: paths, manifests and checkpoints stay the same.
 
 ## Frame Protocol
 
@@ -358,6 +390,56 @@ Manifests are checked with NanoVVM's rules:
 Holdout subsets that skip clips are accepted. Existing manifests are used as they are;
 there is nothing to rebuild or convert.
 
+## Remote Video Storage
+
+On nodes without the mix5 videos (about 3 TB), the videos can stay on S3 in NanoVVM's uncompressed
+tars and be read on demand. When a clip needs a video, the whole video is fetched with one ranged GET
+into a bounded cache on the node SSD and decoded from there. Prefetch threads warm the cache along each
+rank's sampler order. The clips, their order, the RNG and the decoded frames are the same as with local
+files. Manifests, tar indexes, weights and checkpoints stay local. Local files remain the default.
+
+Select a storage file per machine with an environment variable. The training configs do not change, so
+a run resumes the same way with local or remote videos:
+
+```bash
+uv pip install -r pyproject.toml --extra s3          # botocore; local training never imports it
+export VRAE_STORAGE_CONFIG=configs/storage/adobe_s3.yaml   # unset or "local": local files
+export VRAE_VIDEO_CACHE=/mnt/localssd/<user>/nanovvm/video_cache VRAE_VIDEO_CACHE_GIB=300 VRAE_VIDEO_CACHE_RESERVE_GIB=100
+```
+
+[`configs/storage/adobe_s3.yaml`](configs/storage/adobe_s3.yaml) maps each mix5 video directory below
+the data root (`bridgedatav2_video`, `droid_video`, `fineart_video`, `egopro448_video`,
+`egoexo4d_video`) to `$VRAE_S3_ASSETS/data/<dataset>_video.tar` (default
+`s3://phidias/yidongh/checkpoint/assets/nanovvm`) and to its index,
+`<data root>/remote_index/<dataset>_video.tar.index.sqlite`. Relative `local` and `index` paths are
+below the data root. `${NAME:-default}` values are taken from the environment. S3 is reached only
+through the node's EC2 instance role (`credentials: instance_role`). Other credentials in the
+environment are ignored, and `os.environ` is not modified.
+
+- **Same assets as NanoVVM.** The tars, indexes and manifests are the ones NanoVVM's "Prompt for AD"
+  creates. `python -m vrae.storage.remote_video` builds or checks indexes from the tar headers (`index`,
+  `bind`, `verify`, `upload-index`, create-only), lists members, extracts the manifests alone
+  (`extract --pattern 'data/<d>_video/manifests/*' --strip-prefix data --dest <data root>`) and
+  maintains the cache (`cache --stats | --recover | --clear`).
+- **One cache per node.** The cache's byte budget covers every rank and DataLoader worker. A video is
+  downloaded once and never evicted while it is being decoded. `vrae/storage/` is vendored from NanoVVM
+  (`data/`, commit ca80730), and the cache format is the same, so NanoVVM and V-RAE runs on one node can
+  share a cache directory. Use the same capacity and reserve in both.
+- **Checks before weights load.** `check` (Usage step 1) and training test the S3 credentials, each
+  archive's identity against its index (a changed archive is reported as stale), and the cache budget.
+  Every manifest video must resolve in its index. Each read is pinned to the indexed ETag, and a
+  per-member header CRC rejects a stale or misapplied index. With remote storage, `check` ends with
+  "storage check passed".
+- **Logs.** Training prints `[storage] Remote video storage: ...` lines. Every log line has
+  `data/wait_seconds_per_step` (rank 0's wait for batches, per optimizer step). With remote storage it
+  also has NanoVVM's `cache/*` metrics: `hit_rate`, `demand_downloads`, `prefetch_downloads`,
+  `prefetch_used`, `fetched_gib`, `requests`, `retries`, `evictions`, `demand_wait_seconds`,
+  `used_gib` and `inflight_downloads`. The cache's counters are node-wide: with a shared cache they
+  include the other runs.
+- **Cold starts.** A new node starts with an empty cache, and its first steps wait for downloads. The
+  20-step smoke run of the tiny config on one A100 waited 0.9-2.9 s per step on a cold cache.
+- Compressed archives cannot be read by ranged GETs and are refused. Repack them as uncompressed tars.
+
 ## Usage
 
 Run the commands from the repository root with `PYTHONPATH=src` (or after installing the
@@ -366,7 +448,8 @@ package). `configs/paths.local.yaml` is the path file described above.
 **1. Check the configuration.** `--build-only` prints the derived shapes and reads no
 files. `check` resolves every source and confirms that each video root, manifest, and
 `meta.yaml` exists. With `--load-manifests` it also validates every manifest, and with
-`--decode N` it decodes the first clip of N sources.
+`--decode N` it decodes the first clip of N sources. With `VRAE_STORAGE_CONFIG` set, a video root
+exists when its tar index has it, and the remote checks of "Remote Video Storage" run too.
 
 ```bash
 python -m vrae.training.nanovvm_video_pred.train \
@@ -540,6 +623,9 @@ These changes are needed by the ladder and leave the other tasks' behavior uncha
 - `common/accumulation.py`: `clip_and_step` returns the gradient norm before clipping.
   `optimizer_step` still returns only the step flag.
 - `common/wandb.py`: optional `wandb.entity`.
+- `common/sampler.py`: an optional `prefetcher` attribute is told the rank's upcoming order
+  (computed lazily) and how far the DataLoader has drawn. The yielded batches are unchanged, and
+  without a prefetcher nothing runs.
 - `nanovvm_video_pred/train.py`: the scheduler is built after the loader, with
   `steps_per_epoch = len(loader) // gradient_accumulation_steps`. A linear or cosine
   schedule therefore works for this task; before this change it failed. `clip_grad` is
@@ -595,10 +681,12 @@ position and W&B run all continue from the checkpoint.
 ## Tests
 
 ```bash
-PYTHONPATH=src python -m unittest tests.test_nanovvm_video_pred tests.test_nanovvm_scaling_ladder -v
+CUDA_VISIBLE_DEVICES= PYTHONPATH=src python -m unittest \
+  tests.test_nanovvm_video_pred tests.test_nanovvm_scaling_ladder tests.test_remote_video_storage -v
 ```
 
-The tests run on CPU with synthetic videos and small weights. They cover:
+The tests run on CPU with synthetic videos and small weights. Hide the GPUs on a GPU node, as above,
+because the end-to-end test keeps its tiny model on the CPU. They cover:
 
 - the manifest checks, and the frames decoded for a non-zero start (`s=49` gives
   condition frame 49 and targets 52, 55, ..., 97);
@@ -616,7 +704,18 @@ The tests run on CPU with synthetic videos and small weights. They cover:
   - clipping and the returned pre-clip norm, and the training-metric formulas;
   - the `wandb.init` arguments;
   - the exact preprocessing equality with NanoVVM;
-  - each ladder config against the size table and the recipe.
+  - each ladder config against the size table and the recipe;
+- for remote video storage (`test_remote_video_storage.py`, ported from NanoVVM's
+  `tests/test_remote_video.py`; tiny tars through `file://`, no AWS access):
+  - tar indexes (GNU, PAX and ustar names; links; traversal, duplicate and compressed archives
+    refused), resumable builds, and stale archives;
+  - the storage file (environment expansion, roots below the data root, the repository's
+    `adobe_s3.yaml` covering every ladder root), and that local runs never import botocore;
+  - transport errors and retries, and S3 credential isolation and range checks (with botocore);
+  - the node cache: one download per video across processes, no eviction of leased files, the byte
+    budget, killed producers, and failed downloads;
+  - remote clips equal to local ones, prefetch that leaves the batches unchanged, the checker, and a
+    training run with workers whose log has the `cache/*` metrics.
 
 The repository's `.gitignore` excludes `/tests/`, so these files were added with `git add -f`.
 
@@ -630,7 +729,9 @@ The repository's `.gitignore` excludes `/tests/`, so these files were added with
 | `src/vrae/training/nanovvm_video_pred/latent_stats.py` | future normalizer and its identity check |
 | `src/vrae/training/nanovvm_video_pred/train.py` | build checks, training loop, checkpoints |
 | `src/vrae/training/nanovvm_video_pred/sample.py` | sampling from a first frame or a split |
-| `src/vrae/training/nanovvm_video_pred/check.py` | data path and manifest check |
+| `src/vrae/training/nanovvm_video_pred/check.py` | data path, manifest and remote storage check |
+| `src/vrae/storage/` | remote video storage, vendored from NanoVVM: tar indexes (`tar_index.py`), S3 and `file://` reads (`remote_io.py`), the node cache (`video_cache.py`), prefetch, `backend.py`; the storage file (`config.py`), loop metrics (`metrics.py`), the CLI (`remote_video.py`) |
+| `configs/storage/adobe_s3.yaml` | mix5 tars on S3 for AD nodes |
 | `src/vrae/models/dit/first_frame_prediction_dit.py` | the DiT (a subclass of `VRAEVideoDiT`) |
 | `src/vrae/models/dit/conditioning.py` | `FirstFrameConditionAdapter` |
 | `src/vrae/models/encoders/base.py` | `encode_images` single-image entry |

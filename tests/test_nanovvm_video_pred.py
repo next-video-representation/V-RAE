@@ -61,6 +61,7 @@ TRAIN_LOG_KEYS = {
     "parameters/rms",
     "train/epoch",
     "train/global_batch_size",
+    "data/wait_seconds_per_step",
 }
 SAMPLE_LOG_KEYS = (
     {"samples/future16_real_vs_predicted/video_000"},

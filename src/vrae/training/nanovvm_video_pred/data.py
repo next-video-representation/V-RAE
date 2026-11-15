@@ -12,6 +12,11 @@ and splits it:
 Frames stay uint8; the frozen V-RAE encoder applies its own pixel
 normalization. Multi-source data is a clip-level concatenation, so an epoch
 mixes sources in proportion to their clip counts.
+
+Videos are local files unless VRAE_STORAGE_CONFIG maps video roots to uncompressed
+tars on S3 (vrae.storage; README_nanovvm_video_pred.md, "Remote Video Storage"):
+then each video is fetched whole into the bounded node cache when a clip needs it,
+and prefetched along the sampler's order. Clips, order and RNG are unchanged.
 """
 
 from __future__ import annotations
@@ -28,6 +33,14 @@ from torch.utils.data import DataLoader, Dataset
 
 from vrae.data.transforms import center_crop_video, random_crop_video, resize_short_side
 from vrae.paths import ProjectPaths
+from vrae.storage.backend import (
+    StorageBackend,
+    active_storage,
+    configure_storage,
+    is_storage_error,
+)
+from vrae.storage.config import storage_section_from_environment
+from vrae.storage.tar_index import TarIndexError
 from vrae.training.common.contracts import resolve_batch_contract
 from vrae.training.common.sampler import StatefulDistributedBatchSampler
 from vrae.training.nanovvm_video_pred.manifest import (
@@ -166,18 +179,49 @@ def decode_clip_frames(
     where: str,
     rgb_seq_len: int = RGB_SEQ_LEN,
     frame_interval: int = FRAME_INTERVAL,
+    storage: StorageBackend | None = None,
 ) -> tuple[torch.Tensor, np.ndarray]:
-    """Decode exact source frames ``start + interval*k`` as uint8 ``[T,3,H,W]`` with decord."""
+    """Decode exact source frames ``start + interval*k`` as uint8 ``[T,3,H,W]`` with decord.
 
+    A path below a remote storage root is decoded from its leased copy in the node cache.
+    """
+
+    storage = active_storage() if storage is None else storage
+    path = Path(path)
+    try:
+        remote = storage.locate(path)
+    except Exception as error:
+        raise RuntimeError(f"Could not resolve the remote video for {where}: {error}") from error
+    if remote is None:
+        if not path.is_file():
+            raise FileNotFoundError(
+                f"Source video missing for {where}. Check the data root and that the dataset "
+                "kept its directory structure."
+            )
+        return _decode_frames(str(path), start_frame, where, rgb_seq_len, frame_interval)
+    try:
+        lease = storage.lease(remote)
+    except Exception as error:
+        if is_storage_error(error):
+            raise RuntimeError(
+                f"Could not fetch the video for {where} from {remote.description}: {error}"
+            ) from error
+        raise
+    with lease as local:  # pinned in the node cache until decoding is done
+        return _decode_frames(local, start_frame, where, rgb_seq_len, frame_interval)
+
+
+def _decode_frames(
+    path: str,
+    start_frame: int,
+    where: str,
+    rgb_seq_len: int,
+    frame_interval: int,
+) -> tuple[torch.Tensor, np.ndarray]:
     from decord import VideoReader, cpu
 
-    if not path.is_file():
-        raise FileNotFoundError(
-            f"Source video missing for {where}. Check the data root and that the dataset kept "
-            "its directory structure."
-        )
     try:
-        reader = VideoReader(str(path), ctx=cpu(0), num_threads=1)
+        reader = VideoReader(path, ctx=cpu(0), num_threads=1)
     except Exception as error:  # decord raises its own error types
         raise RuntimeError(f"Could not open the video for {where}: {error}") from error
     try:
@@ -193,6 +237,7 @@ def decode_clip_frames(
         raise RuntimeError(
             f"Could not decode frames {indices.tolist()} for {where}: {error}"
         ) from error
+    del reader  # close the file before a cache lease is released
     if frames.ndim != 4 or frames.shape[0] != rgb_seq_len or frames.shape[-1] != 3:
         raise RuntimeError(f"decord returned {frames.shape} for {where}; expected [T,H,W,3]")
     video = torch.from_numpy(np.ascontiguousarray(frames)).permute(0, 3, 1, 2).contiguous()
@@ -265,6 +310,51 @@ def resolve_data_root(config: Mapping[str, Any], paths: ProjectPaths) -> Path:
     return root
 
 
+def configure_nanovvm_storage(
+    config: Mapping[str, Any],
+    paths: ProjectPaths,
+    *,
+    override: str | None = None,
+) -> StorageBackend:
+    """Set the process-wide video storage from VRAE_STORAGE_CONFIG (or override).
+
+    Unset or ``local``: local files, as before. Otherwise the storage file's relative
+    roots and indexes are anchored at this config's NanoVVM data root.
+    """
+
+    section = storage_section_from_environment(
+        data_root=resolve_data_root(config, paths),
+        project_root=paths.project_root,
+        override=override,
+    )
+    return configure_storage(section)
+
+
+def storage_preflight(
+    storage: StorageBackend,
+    roots: Sequence[Path],
+    *,
+    owner: bool,
+) -> list[str]:
+    """Remote storage only: credentials and archive identity of the roots in use (one HEAD
+    each) and the cache budget; the node's owner process also reconciles the cache."""
+
+    if not storage.remote:
+        return []
+    lines = storage.check_remote([str(root) for root in roots])
+    lines.append(f"video cache: {storage.prepare(owner=owner)}")
+    cache, prefetch = storage.config["cache"], storage.config["prefetch"]
+    lines.append(
+        f"cache {cache['dir']}, {cache['capacity_gib']} GiB node budget; prefetch "
+        + (
+            f"{prefetch['depth']} samples ahead with {prefetch['workers']} threads per rank"
+            if prefetch["enabled"]
+            else "disabled"
+        )
+    )
+    return lines
+
+
 def split_source_entries(config: Mapping[str, Any], split: str) -> list[dict[str, str]]:
     """The configured sources of one split, as ``{name, dataset, root, manifest, manifest_meta}``.
 
@@ -316,9 +406,15 @@ def resolve_split_sources(
     config: Mapping[str, Any],
     paths: ProjectPaths,
     split: str,
+    storage: StorageBackend | None = None,
 ) -> list[dict[str, Any]]:
-    """Resolve every source path of a split against the data root and check that it exists."""
+    """Resolve every source path of a split against the data root and check that it exists.
 
+    A video root served by remote storage exists when its index (or bucket) has it; nothing
+    is staged locally. Manifests and meta.yaml are always local files.
+    """
+
+    storage = active_storage() if storage is None else storage
     base = resolve_data_root(config, paths)
     resolved: list[dict[str, Any]] = []
     problems: list[str] = []
@@ -331,7 +427,16 @@ def resolve_split_sources(
             "manifest": _resolve(entry["manifest"], base),
             "manifest_meta": _resolve(entry["manifest_meta"], base),
         }
-        if not item["root"].is_dir():
+        if storage.root_for(item["root"]) is not None:
+            try:
+                if not storage.is_dir(item["root"]):
+                    problems.append(
+                        f"{entry['name']}: video root is not a directory of its remote source: "
+                        f"{item['root']}"
+                    )
+            except TarIndexError as error:
+                problems.append(f"{entry['name']}: {error}")
+        elif not item["root"].is_dir():
             problems.append(f"{entry['name']}: video root is not a directory: {item['root']}")
         for key in ("manifest", "manifest_meta"):
             if not item[key].is_file():
@@ -349,9 +454,10 @@ def load_split_sources(
     config: Mapping[str, Any],
     paths: ProjectPaths,
     split: str,
+    storage: StorageBackend | None = None,
 ) -> list[ManifestClipSource]:
     sources = []
-    for item in resolve_split_sources(config, paths, split):
+    for item in resolve_split_sources(config, paths, split, storage):
         clips = load_clip_manifest(
             item["manifest"],
             item["manifest_meta"],
@@ -384,6 +490,7 @@ class NanoVVMVideoPredictionDataset(Dataset[dict[str, Any]]):
         preprocessing: Mapping[str, Any] | None = None,
         video_decoder: str = "decord",
         check_first_video: bool = True,
+        storage: StorageBackend | None = None,
     ) -> None:
         if not sources:
             raise ValueError("at least one manifest source is required")
@@ -401,6 +508,7 @@ class NanoVVMVideoPredictionDataset(Dataset[dict[str, Any]]):
         self.preprocessing = dict(PREPROCESSING if preprocessing is None else preprocessing)
         validate_preprocessing(self.preprocessing)
         self.video_decoder = str(video_decoder)
+        self.storage = active_storage() if storage is None else storage
         self.cumulative_sizes: list[int] = []
         total = 0
         for source in self.sources:
@@ -408,7 +516,13 @@ class NanoVVMVideoPredictionDataset(Dataset[dict[str, Any]]):
                 raise ValueError(f"source {source.name} has no clips")
             total += len(source)
             self.cumulative_sizes.append(total)
-            if check_first_video:
+            if check_first_video and self.storage.root_for(source.root) is not None:
+                # Remote root: every manifest video must resolve in its index (lookups
+                # only, no download), so a wrong mapping fails before any weights load.
+                self.storage.check_videos(
+                    source.root, source.clips.video_paths, where=f"source {source.name}: "
+                )
+            elif check_first_video:
                 first = source.root / source.clips.video_paths[0]
                 if not first.is_file():
                     raise FileNotFoundError(
@@ -431,6 +545,19 @@ class NanoVVMVideoPredictionDataset(Dataset[dict[str, Any]]):
         source_index = bisect.bisect_right(self.cumulative_sizes, index)
         offset = self.cumulative_sizes[source_index - 1] if source_index else 0
         return self.sources[source_index], index - offset
+
+    def remote_video(self, index: int):
+        """The cache object behind item ``index``, or None for a local file (prefetch)."""
+
+        source, local = self.locate(index)
+        path = source.root / source.clips.video_paths[int(source.clips.video_index[local])]
+        return self.storage.locate(path)
+
+    def video_key(self, index: int) -> tuple[str, int]:
+        """Cheap identity of item ``index``'s video (prefetch deduplication)."""
+
+        source, local = self.locate(index)
+        return source.name, int(source.clips.video_index[local])
 
     def clip_record(self, index: int) -> dict[str, Any]:
         source, local = self.locate(index)
@@ -455,7 +582,9 @@ class NanoVVMVideoPredictionDataset(Dataset[dict[str, Any]]):
             f"{source.name} clip {record['local_index']} "
             f"[{record['start_frame']}, {record['end_frame_exclusive']}) of {path}"
         )
-        frames, indices = decode_clip_frames(path, record["start_frame"], where=where)
+        frames, indices = decode_clip_frames(
+            path, record["start_frame"], where=where, storage=self.storage
+        )
         clip = spatial_preprocess(frames, self.image_size, preprocessing=self.preprocessing)
         expected = (RGB_SEQ_LEN, 3, self.image_size, self.image_size)
         if tuple(clip.shape) != expected or clip.dtype != torch.uint8:
@@ -538,6 +667,11 @@ def build_nanovvm_loader(
         drop_last=drop_last,
         gradient_accumulation_steps=batch.gradient_accumulation_steps,
     )
+    storage = getattr(dataset, "storage", None)
+    if storage is not None and storage.remote and hasattr(dataset, "remote_video"):
+        # Warms the node cache along this rank's order; batches and RNG are untouched.
+        # Close it with sampler.prefetcher.close() when training ends.
+        sampler.prefetcher = storage.prefetcher(dataset.remote_video, dataset.video_key)
     workers = int(config["training"].get("num_workers", 4))
     extra: dict[str, Any] = {}
     if workers > 0:
@@ -569,6 +703,7 @@ __all__ = [
     "build_nanovvm_dataset",
     "build_nanovvm_loader",
     "collate_nanovvm",
+    "configure_nanovvm_storage",
     "decode_clip_frames",
     "frame_protocol_metadata",
     "load_split_sources",
@@ -577,6 +712,7 @@ __all__ = [
     "spatial_preprocess",
     "split_condition_future",
     "split_source_entries",
+    "storage_preflight",
     "validate_frame_protocol",
     "validate_preprocessing",
 ]

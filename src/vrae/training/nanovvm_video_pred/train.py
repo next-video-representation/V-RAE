@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -20,6 +21,8 @@ from torch.nn.parallel import DistributedDataParallel
 from vrae.config import load_config
 from vrae.paths import ProjectPaths, find_project_root, load_project_paths
 from vrae.registry import DIT_MODELS, register_builtin_models
+from vrae.storage.backend import active_storage
+from vrae.storage.metrics import cache_metrics, timed_batches
 from vrae.training.common.accumulation import GradientAccumulator, clip_and_step
 from vrae.training.common.checkpoint import (
     build_training_checkpoint,
@@ -65,8 +68,11 @@ from vrae.training.nanovvm_video_pred.data import (
     VIDEO_DECODERS,
     build_nanovvm_dataset,
     build_nanovvm_loader,
+    configure_nanovvm_storage,
     frame_protocol_metadata,
+    resolve_split_sources,
     split_source_entries,
+    storage_preflight,
     validate_frame_protocol,
     validate_preprocessing,
 )
@@ -480,8 +486,10 @@ def train(
     run: Path,
     *,
     max_steps: int | None = None,
+    storage_report: list[str] | None = None,
 ) -> None:
     distributed = initialize_distributed()
+    storage = active_storage()
     seed_everything(int(config["data"].get("seed", 3407)), rank=distributed.rank)
     stage1, _ = load_frozen_stage1(config, paths, distributed.device)
     stage1_metadata = stage1.metadata()
@@ -512,6 +520,8 @@ def train(
         print(f"[data] train: {len(dataset)} clips from {len(dataset.sources)} sources", flush=True)
         for line in dataset.summary():
             print(f"[data]   {line}", flush=True)
+        for line in storage_report or []:
+            print(f"[storage] Remote video storage: {line}", flush=True)
     loader, sampler = build_nanovvm_loader(
         dataset,
         config,
@@ -617,10 +627,12 @@ def train(
     sample_interval = int(config["wandb"]["sample_interval"])
     clip_grad = config["training"].get("clip_grad")
     metrics = TrainMetrics(distributed.device, accumulation.steps)
+    data_wait = [0.0]  # seconds this rank waited for batches since the last log step
+    cache_previous = storage.stats() if storage.remote and distributed.is_main else {}
     last_saved_step = step
     stop = False
     for epoch in range(start_epoch, epochs):
-        for batch in loader:
+        for batch in timed_batches(loader, data_wait):
             if accumulation.is_first_microstep:
                 optimizer.zero_grad(set_to_none=True)
             with torch.no_grad():
@@ -663,13 +675,19 @@ def train(
                             "optimizer/lr": optimizer.param_groups[0]["lr"],
                             "train/epoch": epoch,
                             "train/global_batch_size": batch_contract.global_batch_size,
+                            "data/wait_seconds_per_step": data_wait[0] / log_interval,
                         }
                     )
+                    if storage.remote:
+                        cache_stats = storage.stats()
+                        values.update(cache_metrics(cache_stats, cache_previous))
+                        cache_previous = cache_stats
                     print(
                         json.dumps({"task": TASK, "epoch": epoch, "step": step, **values}),
                         flush=True,
                     )
                     logger.log(values, step=step)
+                data_wait[0] = 0.0
             if distributed.is_main and step % sample_interval == 0:
                 from vrae.training.nanovvm_video_pred.sample import (
                     decode_future_tokens,
@@ -779,6 +797,10 @@ def train(
                 ),
                 run / "checkpoints",
             )
+    if sampler.prefetcher is not None:
+        sampler.prefetcher.close()
+    if storage.remote:
+        storage.cache.flush_counters()
     logger.finish()
 
 
@@ -792,10 +814,22 @@ def main() -> None:
     initial_paths = load_project_paths(
         initial_config, override=arguments.paths, project_root=find_project_root(arguments.config)
     )
+    # Raw-video storage: local files unless VRAE_STORAGE_CONFIG maps the video roots to S3 tars.
+    # Credentials, archive identities and the cache budget are checked before any weights load.
+    storage = configure_nanovvm_storage(initial_config, initial_paths)
+    storage_report = (
+        storage_preflight(
+            storage,
+            [item["root"] for item in resolve_split_sources(initial_config, initial_paths, "train")],
+            owner=int(os.environ.get("LOCAL_RANK", "0")) == 0,  # one reconciling process per node
+        )
+        if storage.remote
+        else []
+    )
     ensure_latent_stats(initial_config, initial_paths)
     config, paths, run = prepare_run(arguments.config, arguments.paths)
     validate_build(config)
-    train(config, paths, run, max_steps=arguments.max_steps)
+    train(config, paths, run, max_steps=arguments.max_steps, storage_report=storage_report)
 
 
 if __name__ == "__main__":

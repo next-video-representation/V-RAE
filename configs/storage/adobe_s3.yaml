@@ -1,0 +1,55 @@
+# Adobe AI Platform nodes: NanoVVM's raw videos stay on S3 and are read on demand through a bounded
+# node-local SSD cache (README_nanovvm_video_pred.md, "Remote Video Storage"). Use it with any
+# nanovvm_video_pred config, unchanged:
+#   VRAE_STORAGE_CONFIG=configs/storage/adobe_s3.yaml torchrun ... -m vrae.training.nanovvm_video_pred.train ...
+# VRAE_STORAGE_CONFIG=local (or unset) reads local files as before.
+#
+# Each root maps a video directory below the NanoVVM data root (relative `local`; the configs name videos
+# the same way) to one uncompressed tar, $VRAE_S3_ASSETS/data/<dataset>_video.tar, created with
+# `tar -C <parent of data root> -cf - data/<dataset>_video` (hence member_prefix data/<dataset>_video), and
+# to its index, built once by `python -m vrae.storage.remote_video index` (or NanoVVM's remote_video.py:
+# the tars and indexes are the same) and kept in $VRAE_S3_ASSETS/indexes/v1/. Relative `index` paths are
+# below the data root too. A root whose archive or index is missing only fails when a config reads it.
+#
+# ${NAME:-default} is expanded from the environment. The cache format is NanoVVM's: point
+# VRAE_VIDEO_CACHE at NanoVVM's cache (NANOVVM_VIDEO_CACHE) to share one budget on a node, with the same
+# capacity and reserve in both.
+storage:
+  backend: remote
+  s3:
+    region: us-west-2
+    credentials: instance_role      # the node's EC2 role only, like the README's `s5` wrapper
+    use_version_id: false           # true needs s3:GetObjectVersion; If-Match on the ETag pins reads either way
+  roots:
+    - local: bridgedatav2_video
+      archive: ${VRAE_S3_ASSETS:-s3://phidias/yidongh/checkpoint/assets/nanovvm}/data/bridgedatav2_video.tar
+      member_prefix: data/bridgedatav2_video
+      index: remote_index/bridgedatav2_video.tar.index.sqlite
+    - local: droid_video
+      archive: ${VRAE_S3_ASSETS:-s3://phidias/yidongh/checkpoint/assets/nanovvm}/data/droid_video.tar
+      member_prefix: data/droid_video
+      index: remote_index/droid_video.tar.index.sqlite
+    - local: fineart_video
+      archive: ${VRAE_S3_ASSETS:-s3://phidias/yidongh/checkpoint/assets/nanovvm}/data/fineart_video.tar
+      member_prefix: data/fineart_video
+      index: remote_index/fineart_video.tar.index.sqlite
+    - local: egopro448_video
+      archive: ${VRAE_S3_ASSETS:-s3://phidias/yidongh/checkpoint/assets/nanovvm}/data/egopro448_video.tar
+      member_prefix: data/egopro448_video
+      index: remote_index/egopro448_video.tar.index.sqlite
+    - local: egoexo4d_video
+      archive: ${VRAE_S3_ASSETS:-s3://phidias/yidongh/checkpoint/assets/nanovvm}/data/egoexo4d_video.tar
+      member_prefix: data/egoexo4d_video
+      index: remote_index/egoexo4d_video.tar.index.sqlite
+  cache:
+    dir: ${VRAE_VIDEO_CACHE:-/mnt/localssd/${USER:-vrae}/vrae/video_cache}
+    capacity_gib: ${VRAE_VIDEO_CACHE_GIB:-300}           # one budget for the whole node
+    reserve_gib: ${VRAE_VIDEO_CACHE_RESERVE_GIB:-100}    # kept free for env, weights, runs
+    max_downloads: 32
+    wait_timeout_seconds: 900
+  prefetch:
+    enabled: true
+    depth: 128          # samples per rank looked ahead (the DataLoader already reads ~num_workers*prefetch_factor batches ahead)
+    workers: 4          # download threads per rank
+    max_downloads: 16
+    max_reserved_gib: 32

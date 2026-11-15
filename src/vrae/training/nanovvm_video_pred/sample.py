@@ -41,6 +41,7 @@ from vrae.training.nanovvm_video_pred.data import (
     PREPROCESSING,
     build_nanovvm_dataset,
     collate_nanovvm,
+    configure_nanovvm_storage,
     decode_clip_frames,
     spatial_preprocess,
 )
@@ -240,6 +241,7 @@ def run_sampling(arguments: argparse.Namespace) -> list[Path]:
     paths = load_project_paths(
         config, override=arguments.paths, project_root=find_project_root(arguments.config)
     )
+    configure_nanovvm_storage(config, paths)  # VRAE_STORAGE_CONFIG: videos from S3 via the cache
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     stage1, dit, normalizer = load_sampling_stack(
         config, paths, arguments.checkpoint, device, use_ema=not arguments.no_ema

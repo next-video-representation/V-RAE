@@ -36,6 +36,11 @@ dependencies = [
 dev = [
   "ruff>=0.14,<1",
 ]
+# S3-backed video sources (VRAE_STORAGE_CONFIG, README_nanovvm_video_pred.md "Remote Video Storage").
+# Local training never imports it. Install with `uv pip install -r pyproject.toml --extra s3`.
+s3 = [
+  "botocore>=1.35",
+]
 
 [project.urls]
 Homepage = "https://v-rae.github.io/"

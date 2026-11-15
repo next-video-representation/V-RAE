@@ -6,6 +6,12 @@ that each video root, manifest, and meta.yaml exists, reading only meta.yaml.
 frame ranges, record count, SHA-256) and checks each source's first video.
 --decode N decodes the first clip of each source for N sources and reports the
 source frames of the condition and the future.
+
+With VRAE_STORAGE_CONFIG (remote video storage) it also checks the S3 credentials,
+the identity of every archive in use against its index, and the cache budget;
+--load-manifests then resolves every manifest video in its index (no downloads),
+and --decode fetches the decoded videos through the node cache. It ends with
+"storage check passed".
 """
 
 from __future__ import annotations
@@ -16,11 +22,14 @@ from typing import Any
 
 from vrae.config import load_config
 from vrae.paths import find_project_root, load_project_paths
+from vrae.storage.backend import StorageBackend, active_storage
 from vrae.training.nanovvm_video_pred.data import (
     NanoVVMVideoPredictionDataset,
+    configure_nanovvm_storage,
     load_split_sources,
     resolve_data_root,
     resolve_split_sources,
+    storage_preflight,
 )
 from vrae.training.nanovvm_video_pred.manifest import read_meta
 from vrae.training.nanovvm_video_pred.train import validate_build
@@ -32,13 +41,22 @@ def check_config(
     *,
     load_manifests: bool = False,
     decode: int = 0,
+    storage: StorageBackend | None = None,
 ) -> dict[str, Any]:
     validate_build(config)
+    storage = active_storage() if storage is None else storage
     report: dict[str, Any] = {"data_root": str(resolve_data_root(config, paths)), "splits": {}}
     splits = ["train"] + (["val"] if config["data"].get("val") is not None else [])
+    if storage.remote:
+        roots = [
+            item["root"]
+            for split in splits
+            for item in resolve_split_sources(config, paths, split, storage)
+        ]
+        report["storage"] = storage_preflight(storage, roots, owner=False)
     for split in splits:
         entries = []
-        for item in resolve_split_sources(config, paths, split):
+        for item in resolve_split_sources(config, paths, split, storage):
             meta = read_meta(item["manifest_meta"])
             entries.append(
                 {
@@ -60,12 +78,13 @@ def check_config(
             "meta_total_clips": sum(int(entry["meta_total_clips"] or 0) for entry in entries),
         }
         if load_manifests or decode:
-            sources = load_split_sources(config, paths, split)
+            sources = load_split_sources(config, paths, split, storage)
             dataset = NanoVVMVideoPredictionDataset(
                 sources,
                 split=split,
                 image_size=int(config["data"].get("image_size", 256)),
                 preprocessing=config["data"].get("preprocessing"),
+                storage=storage,
             )
             summary["validated_clips"] = len(dataset)
             summary["shares"] = dataset.summary()
@@ -86,6 +105,12 @@ def check_config(
             if decoded:
                 summary["decoded"] = decoded
         report["splits"][split] = summary
+    if storage.remote:
+        report["storage_check"] = (
+            "every manifest video resolves in its index"
+            if load_manifests or decode
+            else "roots and archives only; add --load-manifests to resolve every manifest video"
+        )
     return report
 
 
@@ -102,10 +127,19 @@ def main() -> None:
     paths = load_project_paths(
         config, override=arguments.paths, project_root=find_project_root(arguments.config)
     )
+    storage = configure_nanovvm_storage(config, paths)
     report = check_config(
-        config, paths, load_manifests=arguments.load_manifests, decode=arguments.decode
+        config,
+        paths,
+        load_manifests=arguments.load_manifests,
+        decode=arguments.decode,
+        storage=storage,
     )
+    if storage.remote:
+        report["cache_stats"] = storage.stats()
     print(json.dumps(report, indent=2))
+    if storage.remote:
+        print(f"storage check passed ({report['storage_check']})", flush=True)
 
 
 if __name__ == "__main__":

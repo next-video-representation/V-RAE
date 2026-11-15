@@ -2,16 +2,47 @@ from __future__ import annotations
 
 import math
 from collections import deque
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator, Mapping, Sequence
 
 import torch
 from torch.utils.data import Sampler
 
 
+class _RankOrder(Sequence):
+    """This rank's sample order for one pass, computed on demand (no per-epoch copy).
+
+    Position ``p`` is item ``p % batch_size`` of the rank's ``p // batch_size``-th micro-batch,
+    i.e. ``order[cursor + (p // B) * global_micro + rank + (p % B) * world_size]``.
+    """
+
+    def __init__(self, order, cursor, batches, batch_size, global_micro, rank, world_size):
+        self.order, self.cursor, self.batches = order, cursor, batches
+        self.batch_size, self.global_micro = batch_size, global_micro
+        self.rank, self.world_size = rank, world_size
+
+    def __len__(self) -> int:
+        return self.batches * self.batch_size
+
+    def __getitem__(self, position):
+        if isinstance(position, slice):
+            return [self[i] for i in range(*position.indices(len(self)))]
+        if not 0 <= position < len(self):
+            raise IndexError(position)
+        batch, item = divmod(position, self.batch_size)
+        offset = self.cursor + batch * self.global_micro + self.rank + item * self.world_size
+        return self.order[offset]
+
+
 class StatefulDistributedBatchSampler(Sampler[list[int]]):
-    """Deterministic distributed batches whose global cursor is directly restorable."""
+    """Deterministic distributed batches whose global cursor is directly restorable.
+
+    ``prefetcher`` (optional, vrae.storage.prefetch.Prefetcher) is told this rank's order
+    and how far the DataLoader has drawn, to warm a video cache ahead of the readers; it
+    never changes what is yielded.
+    """
 
     policy = "global_permutation_strided_v1"
+    prefetcher = None
 
     def __init__(
         self,
@@ -71,6 +102,17 @@ class StatefulDistributedBatchSampler(Sampler[list[int]]):
             else self.dataset_size
         )
         dispatch_cursor = self.cursor
+        prefetcher = self.prefetcher if self.drop_last else None
+        if prefetcher is not None:
+            # With drop_last every micro-batch until limit is full: batch_size items per rank.
+            batches = max(0, limit - dispatch_cursor) // global_micro_batch
+            prefetcher.start(
+                _RankOrder(
+                    order, dispatch_cursor, batches, self.batch_size, global_micro_batch,
+                    self.rank, self.world_size,
+                )
+            )
+        drawn = -1
         while dispatch_cursor < limit:
             start = dispatch_cursor
             stop = min(start + global_micro_batch, self.dataset_size)
@@ -80,6 +122,9 @@ class StatefulDistributedBatchSampler(Sampler[list[int]]):
                 break
             dispatch_cursor = stop
             self._pending_stops.append(stop)
+            if prefetcher is not None:
+                drawn += len(local)
+                prefetcher.advance(drawn)
             yield local
 
     def commit_batch(self) -> None:

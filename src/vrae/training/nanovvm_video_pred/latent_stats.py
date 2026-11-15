@@ -34,6 +34,7 @@ from vrae.training.nanovvm_video_pred.data import (
     PREPROCESSING,
     build_nanovvm_dataset,
     collate_nanovvm,
+    configure_nanovvm_storage,
     frame_protocol_metadata,
     resolve_split_sources,
 )
@@ -224,6 +225,7 @@ def main() -> None:
     paths = load_project_paths(
         config, override=arguments.paths, project_root=find_project_root(arguments.config)
     )
+    configure_nanovvm_storage(config, paths)  # VRAE_STORAGE_CONFIG: videos from S3 via the cache
     output = compute_nanovvm_latent_stats(config, paths)
     if output is not None:
         print(f"saved NanoVVM train-future latent statistics to {output}", flush=True)
