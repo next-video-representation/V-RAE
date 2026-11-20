@@ -42,6 +42,7 @@ from vrae.training.nanovvm_video_pred.data import (
     build_nanovvm_dataset,
     collate_nanovvm,
     configure_nanovvm_storage,
+    configured_image_size,
     decode_clip_frames,
     spatial_preprocess,
 )
@@ -252,11 +253,14 @@ def run_sampling(arguments: argparse.Namespace) -> list[Path]:
     written: list[Path] = []
 
     if arguments.split is None:
+        image_size = configured_image_size(config["data"])
         if arguments.first_frame:
-            frame = load_first_frame_image(arguments.first_frame)
+            frame = load_first_frame_image(arguments.first_frame, image_size=image_size)
             name = Path(arguments.first_frame).stem
         else:
-            frame = load_first_frame_from_video(arguments.video, arguments.start_frame)
+            frame = load_first_frame_from_video(
+                arguments.video, arguments.start_frame, image_size=image_size
+            )
             name = f"{Path(arguments.video).stem}@{arguments.start_frame}"
         condition = frame[None].to(device)
         predicted = sample_from_first_frame(

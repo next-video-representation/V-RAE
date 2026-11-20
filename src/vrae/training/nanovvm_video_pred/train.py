@@ -68,13 +68,13 @@ from vrae.training.nanovvm_video_pred.data import (
     CONDITION_FRAMES,
     DATASET_KEY,
     FUTURE_FRAMES,
-    IMAGE_SIZE,
     PREPROCESSING,
     RGB_SEQ_LEN,
     VIDEO_DECODERS,
     build_nanovvm_dataset,
     build_nanovvm_loader,
     configure_nanovvm_storage,
+    configured_image_size,
     frame_protocol_metadata,
     resolve_split_sources,
     split_source_entries,
@@ -93,12 +93,7 @@ SINGLE_IMAGE_ENCODERS = ("eupe", "dinov3", "siglip2")
 
 
 def _image_size(data: Mapping[str, Any]) -> int:
-    value = data.get("image_size", IMAGE_SIZE)
-    if isinstance(value, (list, tuple)):
-        if len(value) != 2 or int(value[0]) != int(value[1]):
-            raise ValueError("data.image_size must be square for the 256x256 center crop")
-        value = value[0]
-    return int(value)
+    return configured_image_size(data)
 
 
 def task_geometry(config: Mapping[str, Any]) -> dict[str, Any]:
@@ -179,8 +174,7 @@ def validate_build(config: Mapping[str, Any]) -> dict[str, Any]:
             "data.preprocessing must be the NanoVVM protocol for aligned condition/future frames: "
             f"{PREPROCESSING}"
         )
-    if _image_size(data) != IMAGE_SIZE:
-        raise ValueError(f"data.image_size must be {IMAGE_SIZE}")
+    _image_size(data)  # square, positive; the patch-size multiple is checked by task_geometry
     if str(data.get("video_decoder", "decord")) not in VIDEO_DECODERS:
         raise ValueError(f"data.video_decoder must be one of {VIDEO_DECODERS}")
     train_sources = split_source_entries(config, "train")

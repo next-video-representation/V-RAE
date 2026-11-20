@@ -32,10 +32,10 @@ from vrae.evaluation.nanovvm_fvd.metrics import weight_identity
 from vrae.paths import ProjectPaths
 from vrae.training.nanovvm_video_pred.data import (
     FRAME_INTERVAL,
-    IMAGE_SIZE,
     RGB_SEQ_LEN,
     _reject_interpolation,
     _resolve,
+    configured_image_size,
     resolve_data_root,
 )
 from vrae.training.nanovvm_video_pred.latents import (
@@ -54,8 +54,12 @@ def validate_fvd_section(config: Mapping[str, Any]) -> dict[str, Any] | None:
     section = validate_fvd_settings(
         copy.deepcopy(dict(section)), frame_interval=FRAME_INTERVAL, num_frames=RGB_SEQ_LEN
     )
-    if int(section.get("image_size", IMAGE_SIZE)) != IMAGE_SIZE:
-        raise ValueError(f"fvd.image_size must be {IMAGE_SIZE}: frame 0 is the model's condition")
+    data_size = configured_image_size(config.get("data") or {})
+    section.setdefault("image_size", data_size)  # an unset fvd.image_size follows the training data
+    if int(section["image_size"]) != data_size:
+        raise ValueError(
+            f"fvd.image_size must equal data.image_size ({data_size}): frame 0 is the model's condition"
+        )
     return section
 
 

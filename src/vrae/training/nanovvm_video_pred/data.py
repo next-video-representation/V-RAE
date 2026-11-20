@@ -58,7 +58,7 @@ FRAME_INTERVAL = 3
 CONDITION_FRAMES = 1
 FUTURE_FRAMES = 16
 SOURCE_FRAME_SPAN = clip_span(RGB_SEQ_LEN, FRAME_INTERVAL)
-IMAGE_SIZE = 256
+IMAGE_SIZE = 256  # default data.image_size (NanoVVM's 256x256 protocol); other square sizes are allowed
 PREPROCESSING: dict[str, Any] = {
     "horizontal_flip_prob": 0.0,
     "resize": {"mode": "short_side", "interpolation": "bilinear", "antialias": False},
@@ -99,6 +99,22 @@ def validate_frame_protocol(data: Mapping[str, Any]) -> None:
                 f"data.{key} must be {value} for NanoVVM cond1gen16_interval3 prediction, "
                 f"got {actual!r}"
             )
+
+
+def configured_image_size(data: Mapping[str, Any]) -> int:
+    """data.image_size as one int (IMAGE_SIZE when unset; a square [h, w] pair is accepted).
+
+    Any positive square size works with the same short-side resize and center crop; the encoder
+    patch-size divisibility is checked where the token grid is derived (train.task_geometry).
+    """
+    value = data.get("image_size", IMAGE_SIZE)
+    if isinstance(value, (list, tuple)):
+        if len(value) != 2 or int(value[0]) != int(value[1]):
+            raise ValueError("data.image_size must be square for the center crop")
+        value = value[0]
+    if isinstance(value, bool) or int(value) <= 0:
+        raise ValueError(f"data.image_size must be a positive integer, got {value!r}")
+    return int(value)
 
 
 def validate_preprocessing(config: object) -> None:
@@ -690,6 +706,7 @@ def build_nanovvm_loader(
 
 
 __all__ = [
+    "configured_image_size",
     "CONDITION_FRAMES",
     "DATASET_KEY",
     "FRAME_INTERVAL",

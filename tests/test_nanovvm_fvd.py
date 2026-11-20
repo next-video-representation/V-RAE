@@ -178,7 +178,7 @@ class FVDConfigTest(unittest.TestCase):
             ({"baselines": ["constant_velocity_2frame"]}, "subset"),
             ({"colour": 1}, "Unknown fvd keys"),
             ({"interval": 0}, "positive integer"),
-            ({"image_size": 128}, "must be 256"),
+            ({"image_size": 128}, r"must equal data.image_size \(256\)"),
             ({"frame_interval": 1}, "frame interval"),
             ({"encoders": {"inception": {"checkpoint": "x"}}}, "Unknown FVD encoder"),
             ({"splits": {"holdout": {"sources": []}}}, "must be named"),
@@ -186,6 +186,16 @@ class FVDConfigTest(unittest.TestCase):
         for override, match in cases:
             with self.subTest(match=match), self.assertRaisesRegex(ValueError, match):
                 validate_fvd_section({"fvd": fvd_section(**override)})
+
+    def test_image_size_follows_the_training_data(self):
+        data = {"image_size": 128}
+        section = validate_fvd_section({"data": data, "fvd": fvd_section(image_size=128)})
+        self.assertEqual(section["image_size"], 128)
+        unset = fvd_section()
+        unset.pop("image_size")
+        self.assertEqual(validate_fvd_section({"data": data, "fvd": unset})["image_size"], 128)
+        with self.assertRaisesRegex(ValueError, r"must equal data.image_size \(128\)"):
+            validate_fvd_section({"data": data, "fvd": fvd_section(image_size=256)})
 
     def test_resume_ignores_the_fvd_section(self):
         from vrae.training.common.contracts import compare_resolved_configs
