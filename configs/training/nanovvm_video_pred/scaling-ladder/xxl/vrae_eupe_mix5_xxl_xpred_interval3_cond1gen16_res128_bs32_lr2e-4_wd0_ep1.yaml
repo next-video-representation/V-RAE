@@ -1,0 +1,24 @@
+# 128x128, batch-32 twin of vrae_eupe_mix5_xxl_xpred_interval3_cond1gen16_bs64_lr2e-4_wd0_ep1.yaml. Differences:
+#   run_name                       bs64 -> res128_bs32
+#   data.image_size, fvd.image_size  256 -> 128 (short-side resize to 128, center crop; EUPE-B/16 gives 8x8 tokens,
+#                                  the V-RAE decoder interpolates its 16x16 position grid)
+#   training.global_batch_size     64 -> 32, gradient_accumulation_steps 4 -> 1 (2 GPUs: 16 clips each)
+#   transport.time_dist_shift      13.856... -> sqrt(4 chunks*8*8*768/4096) = 6.928203230275509 (train.py derives it
+#                                  from the token grid and requires the config to match)
+#   latent_normalizer.path         a separate res128 statistics file: the future-latent statistics are fit at the
+#                                  data resolution, so the 256 file does not apply (fit on first launch if missing)
+include: vrae_eupe_mix5_xxl_xpred_interval3_cond1gen16_bs64_lr2e-4_wd0_ep1.yaml
+run_name: vrae_eupe_mix5_xxl_xpred_interval3_cond1gen16_res128_bs32_lr2e-4_wd0_ep1
+data:
+  image_size: 128
+fvd:
+  image_size: 128
+transport:
+  time_dist_shift: 6.928203230275509
+latent_normalizer:
+  path: ckpts/nanovvm_video_pred/latent_stats/eupe_mix5_cond1gen16_res128_future_vrae_ema_bf16.pt
+training:
+  global_batch_size: 32
+  gradient_accumulation_steps: 1
+wandb:
+  tags: [nanovvm, video_prediction, first_frame, eupe, mix5, scaling_ladder, xxl, res128, bs32]

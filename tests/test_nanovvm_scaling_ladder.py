@@ -42,6 +42,11 @@ def ladder_path(size: str) -> Path:
     return LADDER / size / f"{stem}.yaml"
 
 
+def ladder_res128_path(size: str) -> Path:
+    stem = f"vrae_eupe_mix5_{size}_xpred_interval3_cond1gen16_res128_bs32_lr2e-4_wd0_ep1"
+    return LADDER / size / f"{stem}.yaml"
+
+
 # ---------------------------------------------------------------- NanoVVM reference
 # Verbatim copy of resize_video, resize_short_side, random_crop_video,
 # validate_preprocessing and spatial_preprocess from nanovvm data/online.py at
@@ -548,8 +553,34 @@ class LadderConfigTest(unittest.TestCase):
         files = sorted(str(path.relative_to(LADDER)) for path in LADDER.rglob("*.yaml"))
         self.assertEqual(
             files, sorted(["_mix5_common.yaml"]
-                          + [str(ladder_path(size).relative_to(LADDER)) for size in SIZES])
+                          + [str(ladder_path(size).relative_to(LADDER)) for size in SIZES]
+                          + [str(ladder_res128_path(size).relative_to(LADDER)) for size in SIZES])
         )
+
+    def test_res128_variants(self):
+        # Each 128x128 batch-32 twin differs from its 256 batch-64 base only in these keys.
+        for size in SIZES:
+            with self.subTest(size=size):
+                base = copy.deepcopy(self.configs[size])
+                variant = load_config(ladder_res128_path(size))
+                self.assertEqual(variant["data"]["image_size"], 128)
+                self.assertEqual(variant["fvd"]["image_size"], 128)
+                self.assertEqual(variant["training"]["global_batch_size"], 32)
+                self.assertEqual(variant["training"]["gradient_accumulation_steps"], 1)
+                self.assertIn("res128", variant["latent_normalizer"]["path"])
+                self.assertNotEqual(variant["latent_normalizer"]["path"], base["latent_normalizer"]["path"])
+                self.assertEqual(variant["wandb"]["tags"], base["wandb"]["tags"] + ["res128", "bs32"])
+                geometry = nv_train.task_geometry(variant)
+                self.assertEqual(geometry["latent_grid"], [8, 8])
+                self.assertAlmostEqual(variant["transport"]["time_dist_shift"], geometry["time_dist_shift"], places=12)
+                for section, keys in {"data": ["image_size"], "fvd": ["image_size"],
+                                      "transport": ["time_dist_shift"],
+                                      "training": ["global_batch_size", "gradient_accumulation_steps"],
+                                      "latent_normalizer": ["path"], "wandb": ["tags"]}.items():
+                    for key in keys:
+                        base[section][key] = variant[section][key]
+                base["run_name"] = variant["run_name"]
+                self.assertEqual(variant, base)
 
     def test_sizes_and_parameter_counts(self):
         default = load_config(ROOT / "configs/models/dit_first_frame_prediction.yaml")["dit"]
