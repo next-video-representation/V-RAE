@@ -119,12 +119,12 @@ def validate_normalizer_compatibility(
     split: str | None = None,
     scope: str | None = None,
 ) -> None:
-    from vrae.training.common.contracts import STAGE1_STRUCTURE_FIELDS
+    from vrae.training.common.contracts import stage1_structure_fields
 
     recorded = normalizer.metadata.get("stage1", normalizer.metadata)
     if not isinstance(recorded, Mapping):
         raise ValueError("Latent normalizer stage1 metadata must be a mapping")
-    fields = STAGE1_STRUCTURE_FIELDS
+    fields = stage1_structure_fields(stage1_metadata)  # V-RAE's fields unless stage 1 is Wan2.2
     mismatches = [field for field in fields if recorded.get(field) != stage1_metadata.get(field)]
     if mismatches:
         raise ValueError(f"Latent normalizer V-RAE metadata mismatch: {mismatches}")

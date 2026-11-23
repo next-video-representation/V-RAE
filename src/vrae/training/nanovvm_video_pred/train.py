@@ -3,6 +3,12 @@
 One observed RGB frame conditions the DiT through spatial AdaLN; the DiT
 generates the four V-RAE latent chunks of the next sixteen frames. Noise,
 supervision, and the full/base flow-matching losses act on the future chunks only.
+
+``stage1.type: wan22_vae`` swaps the frozen V-RAE for the Wan2.2 VAE (16x spatial, 4x temporal,
+48 channels; vrae.models.video_vae.backend) and ``dit.name: wan_ti2v_dit`` for a Wan2.2-TI2V DiT
+that injects the clean first-frame latent z0 as latent frame 0 at t = 0
+(vrae.models.dit.wan_ti2v_dit). Data, transport, optimization, EMA, CFG dropout, internal
+guidance, sampling and FVD are this same loop.
 """
 
 from __future__ import annotations
@@ -48,10 +54,12 @@ from vrae.training.common.engine import (
     build_flow_transport,
     dit_architecture_metadata,
     flow_transport_metadata,
+    load_frozen_latent_backend,
     load_frozen_stage1,
     parse_config_argument,
     prepare_run,
     seed_everything,
+    stage1_type,
 )
 from vrae.training.common.latent_norm import LatentNormalizer
 from vrae.training.common.optim import (
@@ -84,12 +92,32 @@ from vrae.training.nanovvm_video_pred.data import (
 )
 from vrae.training.nanovvm_video_pred.fvd import evaluate as evaluate_fvd
 from vrae.training.nanovvm_video_pred.fvd import resolve_fvd_config, validate_fvd_section
-from vrae.training.nanovvm_video_pred.latents import encode_condition_and_future
+from vrae.training.nanovvm_video_pred.latents import (
+    condition_features,
+    decode_future_tokens,
+    encode_condition_and_future,
+)
 
 TASK = "nanovvm_video_pred"
 DIT_NAME = "vrae_first_frame_prediction_dit"
+WAN_DIT_NAME = "wan_ti2v_dit"
 TEMPORAL_COMPRESSION = 4
 SINGLE_IMAGE_ENCODERS = ("eupe", "dinov3", "siglip2")
+# Wan2.2 VAE latent space (vrae.models.video_vae.backend): 16x spatial, 4x temporal, 48 channels.
+WAN_SPATIAL_COMPRESSION = 16
+WAN_TEMPORAL_COMPRESSION = 4
+WAN_LATENT_CHANNELS = 48
+# DiTs allowed per stage1.type. wan_ti2v_dit reads z0 as a latent frame, so it needs a stage 1
+# whose condition lives in the target latent space (Wan2.2), not V-RAE's pre-pool features.
+DIT_NAMES = {"vrae": (DIT_NAME,), "wan22_vae": (WAN_DIT_NAME, DIT_NAME)}
+
+
+def load_latent_backend(config: Mapping[str, Any], paths: ProjectPaths, device: torch.device):
+    """The frozen stage 1 of ``stage1.type`` (V-RAE through this module's load_frozen_stage1)."""
+
+    if stage1_type(config) == "vrae":
+        return load_frozen_stage1(config, paths, device)
+    return load_frozen_latent_backend(config, paths, device)
 
 
 def _image_size(data: Mapping[str, Any]) -> int:
@@ -97,34 +125,55 @@ def _image_size(data: Mapping[str, Any]) -> int:
 
 
 def task_geometry(config: Mapping[str, Any]) -> dict[str, Any]:
-    """Shapes derived from the encoder, image size, and future frame count."""
+    """Shapes derived from the stage 1 (V-RAE encoder or Wan2.2 VAE), image size, and future frame count."""
 
-    encoder = config["model"]["encoder"]
     image_size = _image_size(config["data"])
-    patch_size = int(encoder["patch_size"])
-    if image_size % patch_size:
-        raise ValueError("image_size must be divisible by the encoder patch size")
-    tubelet = int(encoder.get("encoder_tubelet_size", 1))
-    group = int(config["model"]["pooling"]["group_size"])
-    if tubelet * group != TEMPORAL_COMPRESSION:
-        raise ValueError("V-RAE must compress time by four")
-    if FUTURE_FRAMES % TEMPORAL_COMPRESSION:
-        raise ValueError("future frames must fill whole V-RAE chunks")
-    grid = (image_size // patch_size, image_size // patch_size)
-    channels = int(encoder["hidden_size"])
-    chunks = FUTURE_FRAMES // TEMPORAL_COMPRESSION
+    if stage1_type(config) == "wan22_vae":
+        if image_size % WAN_SPATIAL_COMPRESSION:
+            raise ValueError(
+                f"image_size must be divisible by the Wan2.2 VAE's {WAN_SPATIAL_COMPRESSION}x "
+                "spatial compression"
+            )
+        if FUTURE_FRAMES % WAN_TEMPORAL_COMPRESSION:
+            raise ValueError("future frames must fill whole Wan2.2 latent frames")
+        grid = (image_size // WAN_SPATIAL_COMPRESSION, image_size // WAN_SPATIAL_COMPRESSION)
+        channels = WAN_LATENT_CHANNELS
+        chunks = FUTURE_FRAMES // WAN_TEMPORAL_COMPRESSION
+    else:
+        encoder = config["model"]["encoder"]
+        patch_size = int(encoder["patch_size"])
+        if image_size % patch_size:
+            raise ValueError("image_size must be divisible by the encoder patch size")
+        tubelet = int(encoder.get("encoder_tubelet_size", 1))
+        group = int(config["model"]["pooling"]["group_size"])
+        if tubelet * group != TEMPORAL_COMPRESSION:
+            raise ValueError("V-RAE must compress time by four")
+        if FUTURE_FRAMES % TEMPORAL_COMPRESSION:
+            raise ValueError("future frames must fill whole V-RAE chunks")
+        grid = (image_size // patch_size, image_size // patch_size)
+        channels = int(encoder["hidden_size"])
+        chunks = FUTURE_FRAMES // TEMPORAL_COMPRESSION
     tokens = grid[0] * grid[1]
-    dit_patch = config["dit"].get("patch_size", 1)
-    dit_patch = (
-        (int(dit_patch), int(dit_patch))
-        if isinstance(dit_patch, int)
-        else tuple(int(value) for value in dit_patch)
-    )
+    if str(config["dit"].get("name")) == WAN_DIT_NAME:
+        # Wan's (t, h, w) patch; z0 is one latent frame, so the temporal patch is 1.
+        value = config["dit"].get("patch_size", [1, 1, 1])
+        wan_patch = (1, int(value), int(value)) if isinstance(value, int) else tuple(int(v) for v in value)
+        if len(wan_patch) != 3 or wan_patch[0] != 1:
+            raise ValueError("dit.patch_size of wan_ti2v_dit must be [1, p_h, p_w]")
+        dit_patch = wan_patch[1:]
+        encoder_width = int(config["dit"].get("dim", 3072))
+    else:
+        dit_patch = config["dit"].get("patch_size", 1)
+        dit_patch = (
+            (int(dit_patch), int(dit_patch))
+            if isinstance(dit_patch, int)
+            else tuple(int(value) for value in dit_patch)
+        )
+        hidden = config["dit"].get("hidden_size", [1536, 2048])
+        encoder_width = int(hidden if isinstance(hidden, int) else hidden[0])
     if grid[0] % dit_patch[0] or grid[1] % dit_patch[1]:
         raise ValueError("the latent grid must be divisible by dit.patch_size")
     patches = (grid[0] // dit_patch[0]) * (grid[1] // dit_patch[1])
-    hidden = config["dit"].get("hidden_size", [1536, 2048])
-    encoder_width = int(hidden if isinstance(hidden, int) else hidden[0])
     return {
         "image_size": image_size,
         "latent_grid": list(grid),
@@ -179,20 +228,37 @@ def validate_build(config: Mapping[str, Any]) -> dict[str, Any]:
         raise ValueError(f"data.video_decoder must be one of {VIDEO_DECODERS}")
     train_sources = split_source_entries(config, "train")
     val_sources = split_source_entries(config, "val") if data.get("val") is not None else []
-    encoder = config["model"]["encoder"]
-    if str(encoder.get("name")) not in SINGLE_IMAGE_ENCODERS:
-        raise ValueError(
-            f"first-frame conditioning needs a per-frame image encoder {SINGLE_IMAGE_ENCODERS}, "
-            f"got {encoder.get('name')!r}"
-        )
+    kind = stage1_type(config)
+    if kind == "vrae":
+        encoder = config["model"]["encoder"]
+        if str(encoder.get("name")) not in SINGLE_IMAGE_ENCODERS:
+            raise ValueError(
+                f"first-frame conditioning needs a per-frame image encoder {SINGLE_IMAGE_ENCODERS}, "
+                f"got {encoder.get('name')!r}"
+            )
+    else:
+        from vrae.models.video_vae.backend import WAN22_REVISION
+
+        if "model" in config:
+            raise ValueError("a wan22_vae stage 1 takes no V-RAE model section (model.encoder etc.)")
+        stage1 = config["stage1"]
+        if not str(stage1.get("checkpoint", "")):
+            raise ValueError("stage1.checkpoint must name Wan2.2_VAE.pth")
+        if str(stage1.get("precision", "fp32")) != "fp32":
+            raise ValueError("stage1.precision must be fp32 for the Wan2.2 VAE")
+        if str(stage1.get("revision", WAN22_REVISION)) != WAN22_REVISION:
+            raise ValueError(f"stage1.revision must be the vendored Wan2.2 commit {WAN22_REVISION}")
     dit = config["dit"]
-    if str(dit.get("name")) != DIT_NAME:
-        raise ValueError(f"NanoVVM future prediction must use {DIT_NAME}")
+    dit_name = str(dit.get("name"))
+    if dit_name not in DIT_NAMES[kind]:
+        if kind == "vrae":
+            raise ValueError(f"NanoVVM future prediction must use {DIT_NAME}")
+        raise ValueError(f"a {kind} stage 1 needs dit.name in {DIT_NAMES[kind]}, got {dit_name!r}")
     geometry = task_geometry(config)
     channels = geometry["latent_channels"]
     for key in ("input_dim", "in_channels", "frame_channels"):
         if key in dit and int(dit[key]) != channels:
-            raise ValueError(f"dit.{key} must match the V-RAE hidden size {channels}")
+            raise ValueError(f"dit.{key} must match the stage-1 latent width {channels}")
     for key in ("future_chunks", "num_future_chunks", "num_chunks", "num_frames"):
         if key in dit and int(dit[key]) != geometry["future_chunks"]:
             raise ValueError(f"dit.{key} must be {geometry['future_chunks']} future chunks")
@@ -213,26 +279,41 @@ def validate_build(config: Mapping[str, Any]) -> dict[str, Any]:
     grid = geometry["latent_grid"]
     patches = geometry["dit_patches_per_chunk"]
     width = geometry["dit_encoder_width"]
-    return {
-        "task": TASK,
-        "dit": DIT_NAME,
-        "frame_protocol": frame_protocol_metadata(),
-        "image_size": [geometry["image_size"], geometry["image_size"]],
-        "latent_grid": grid,
-        "future_chunks": geometry["future_chunks"],
-        "transport": transport,
-        "expected_time_dist_shift": geometry["time_dist_shift"],
-        "shapes": {
-            "clip_rgb": [batch, RGB_SEQ_LEN, 3, geometry["image_size"], geometry["image_size"]],
-            "condition_rgb": [batch, 3, geometry["image_size"], geometry["image_size"]],
-            "future_rgb": [batch, FUTURE_FRAMES, 3, geometry["image_size"], geometry["image_size"]],
+    size = geometry["image_size"]
+    if dit_name == WAN_DIT_NAME:
+        frames = 1 + geometry["future_chunks"]
+        shapes = {
+            "clip_rgb": [batch, RGB_SEQ_LEN, 3, size, size],
+            "condition_rgb": [batch, 3, size, size],
+            "future_rgb": [batch, FUTURE_FRAMES, 3, size, size],
+            "z0": [batch, geometry["tokens_per_chunk"], channels],
+            "z_future": [batch, geometry["future_chunks"], geometry["tokens_per_chunk"], channels],
+            "dit_sequence": [batch, frames * patches, width],
+            "token_timesteps": [batch, frames * patches],
+            "dit_output": [batch, geometry["future_chunks"], geometry["tokens_per_chunk"], channels],
+        }
+    else:
+        shapes = {
+            "clip_rgb": [batch, RGB_SEQ_LEN, 3, size, size],
+            "condition_rgb": [batch, 3, size, size],
+            "future_rgb": [batch, FUTURE_FRAMES, 3, size, size],
             "frame_features": [batch, geometry["tokens_per_chunk"], channels],
             "z_future": [batch, geometry["future_chunks"], geometry["tokens_per_chunk"], channels],
             "frame_condition": [batch, patches, width],
             "time_condition": [batch, 1, width],
             "adaln_condition": [batch, geometry["future_chunks"] * patches, width],
             "dit_sequence": [batch, geometry["future_chunks"] * patches, width],
-        },
+        }
+    summary = {
+        "task": TASK,
+        "dit": dit_name,
+        "frame_protocol": frame_protocol_metadata(),
+        "image_size": [geometry["image_size"], geometry["image_size"]],
+        "latent_grid": grid,
+        "future_chunks": geometry["future_chunks"],
+        "transport": transport,
+        "expected_time_dist_shift": geometry["time_dist_shift"],
+        "shapes": shapes,
         "condition_frames": CONDITION_FRAMES,
         "train_sources": [entry["name"] for entry in train_sources],
         "val_sources": [entry["name"] for entry in val_sources],
@@ -245,6 +326,9 @@ def validate_build(config: Mapping[str, Any]) -> dict[str, Any]:
             "use_ema": bool(fvd.get("use_ema", False)),
         },
     }
+    if kind != "vrae":
+        summary["stage1_type"] = kind
+    return summary
 
 
 def ensure_latent_stats(config: Mapping[str, Any], paths: ProjectPaths) -> Path:
@@ -282,6 +366,27 @@ def ensure_latent_stats(config: Mapping[str, Any], paths: ProjectPaths) -> Path:
 def build_nanovvm_dit(config: Mapping[str, Any], stage1_metadata: Mapping[str, Any]) -> nn.Module:
     register_builtin_models()
     image_size = _image_size(config["data"])
+    if stage1_metadata.get("type") == "wan22_vae":
+        compression = int(stage1_metadata["spatial_compression"])
+        if image_size % compression:
+            raise ValueError("image size must be divisible by the Wan2.2 VAE's spatial compression")
+        grid_size = (image_size // compression, image_size // compression)
+        if list(grid_size) != [int(value) for value in stage1_metadata["latent_grid"]]:
+            raise ValueError(
+                f"data.image_size gives a {list(grid_size)} grid, the Wan2.2 backend "
+                f"{stage1_metadata['latent_grid']}"
+            )
+        temporal = int(stage1_metadata["temporal_compression"])
+        if FUTURE_FRAMES % temporal:
+            raise ValueError("future frames must fill whole Wan2.2 latent frames")
+        channels = int(stage1_metadata["latent_channels"])
+        return DIT_MODELS.build(
+            config["dit"],
+            grid_size=grid_size,
+            in_channels=channels,
+            frame_channels=channels,
+            future_chunks=FUTURE_FRAMES // temporal,
+        )
     patch_size = int(stage1_metadata["patch_size"])
     if image_size % patch_size:
         raise ValueError("image size must be divisible by the V-RAE patch size")
@@ -308,18 +413,25 @@ def nanovvm_model_metadata(
     from vrae.training.common.contracts import structural_stage1_metadata
     from vrae.training.common.latent_norm import normalizer_identity
 
+    dit_name = str(config["dit"].get("name", DIT_NAME))
+    if stage1_metadata.get("type") != "wan22_vae":
+        first_frame_condition = "pre_pool_patch_features_spatial_adaln"
+    elif dit_name == WAN_DIT_NAME:
+        first_frame_condition = "wan22_z0_latent_frame_t0"
+    else:
+        first_frame_condition = "wan22_z0_spatial_adaln"
     return {
         "stage1": structural_stage1_metadata(stage1_metadata),
         "stage1_checkpoint": str(config["stage1"]["checkpoint"]),
         "latent_normalizer_source": str(config["latent_normalizer"]["path"]),
-        "dit_name": DIT_NAME,
+        "dit_name": dit_name,
         "dit_input_dim": int(dit.in_channels),
         "dit_frame_channels": int(dit.frame_channels),
         "dit_grid_size": list(dit.grid_size),
         "future_chunks": int(dit.future_chunks),
         "frame_protocol": frame_protocol_metadata(),
         "image_size": [_image_size(config["data"])] * 2,
-        "first_frame_condition": "pre_pool_patch_features_spatial_adaln",
+        "first_frame_condition": first_frame_condition,
         **dit_architecture_metadata(dit),
         "transport": flow_transport_metadata(config),
         "latent_normalizer_identity": (
@@ -354,7 +466,11 @@ def prepare_nanovvm_latents(
     *,
     device: torch.device | str,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """RGB batch -> (first-frame features ``[B,h*w,C]``, raw future latents ``[B,4,h*w,C]``)."""
+    """RGB batch -> (first-frame features ``[B,h*w,C]``, raw future latents ``[B,4,h*w,C]``).
+
+    Wan2.2 VAE: the first element is the raw z0 (``condition_features`` normalizes it for the DiT;
+    decoding uses it raw).
+    """
 
     condition = batch["condition"].to(device, non_blocking=True)
     future = batch["future"].to(device, non_blocking=True)
@@ -502,7 +618,7 @@ def train(
     distributed = initialize_distributed()
     storage = active_storage()
     seed_everything(int(config["data"].get("seed", 3407)), rank=distributed.rank)
-    stage1, _ = load_frozen_stage1(config, paths, distributed.device)
+    stage1, _ = load_latent_backend(config, paths, distributed.device)
     stage1_metadata = stage1.metadata()
     if not stage1.supports_single_image:
         raise ValueError("the frozen V-RAE encoder has no single-image feature path")
@@ -677,9 +793,11 @@ def train(
             if accumulation.is_first_microstep:
                 optimizer.zero_grad(set_to_none=True)
             with torch.no_grad():
-                frame_features, raw_future = prepare_nanovvm_latents(
+                raw_condition, raw_future = prepare_nanovvm_latents(
                     stage1, batch, device=distributed.device
                 )
+                # V-RAE: the frame features themselves; Wan2.2: the task-normalized z0.
+                frame_features = condition_features(stage1, raw_condition, normalizer)
                 future = normalizer.normalize(raw_future)
             with accumulation.sync_context(model):
                 with precision.autocast():
@@ -730,10 +848,7 @@ def train(
                     logger.log(values, step=step)
                 data_wait[0] = 0.0
             if distributed.is_main and step % sample_interval == 0:
-                from vrae.training.nanovvm_video_pred.sample import (
-                    decode_future_tokens,
-                    predict_future_tokens,
-                )
+                from vrae.training.nanovvm_video_pred.sample import predict_future_tokens
 
                 count = min(int(config["wandb"].get("sample_count", 2)), frame_features.shape[0])
                 indices = [int(value) for value in batch["index"][:count].tolist()]
@@ -754,7 +869,10 @@ def train(
                         transport=transport,
                     )
                     predicted = decode_future_tokens(
-                        stage1, predicted_tokens, grid_size=tuple(dit.grid_size)
+                        stage1,
+                        predicted_tokens,
+                        grid_size=tuple(dit.grid_size),
+                        condition=raw_condition[:count],  # Wan2.2 decodes with the raw z0
                     )
                 dit.train(was_training)
                 # Ground truth is the RGB clip[:, 1:17], not a V-RAE reconstruction.
@@ -918,6 +1036,7 @@ __all__ = [
     "TrainMetrics",
     "build_nanovvm_dit",
     "ensure_latent_stats",
+    "load_latent_backend",
     "load_task_normalizer",
     "nanovvm_model_metadata",
     "parameter_metrics",

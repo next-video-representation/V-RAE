@@ -2,6 +2,7 @@
 
 Without flags: resolve every train/val source against the data root and check
 that each video root, manifest, and meta.yaml exists, reading only meta.yaml.
+With ``stage1.type: wan22_vae`` it also checks that the Wan2.2 VAE weights exist.
 --load-manifests also runs the full manifest validation (schema, sampling,
 frame ranges, record count, SHA-256) and checks each source's first video.
 --decode N decodes the first clip of each source for N sources and reports the
@@ -23,6 +24,7 @@ from typing import Any
 from vrae.config import load_config
 from vrae.paths import find_project_root, load_project_paths
 from vrae.storage.backend import StorageBackend, active_storage
+from vrae.training.common.engine import stage1_type
 from vrae.training.nanovvm_video_pred.data import (
     NanoVVMVideoPredictionDataset,
     configure_nanovvm_storage,
@@ -46,6 +48,17 @@ def check_config(
     validate_build(config)
     storage = active_storage() if storage is None else storage
     report: dict[str, Any] = {"data_root": str(resolve_data_root(config, paths)), "splits": {}}
+    if stage1_type(config) == "wan22_vae":
+        # The Wan2.2 VAE weights (Wan2.2_VAE.pth of Wan-AI/Wan2.2-TI2V-5B, a symlink under ckpts/).
+        weights = paths.checkpoint(config["stage1"]["checkpoint"])
+        if not weights.resolve().is_file():
+            raise FileNotFoundError(f"Wan2.2 VAE weights are not a file: {weights}")
+        report["stage1"] = {
+            "type": "wan22_vae",
+            "checkpoint": str(weights),
+            "resolved": str(weights.resolve()),
+            "bytes": weights.resolve().stat().st_size,
+        }
     splits = ["train"] + (["val"] if config["data"].get("val") is not None else [])
     if storage.remote:
         roots = [

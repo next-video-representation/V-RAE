@@ -117,6 +117,9 @@ def _training_progress_line(
 
 
 def dit_architecture_metadata(dit: nn.Module) -> dict[str, Any]:
+    describe = getattr(dit, "architecture_metadata", None)
+    if callable(describe):  # DiTs other than the V-RAE DDT describe themselves (wan_ti2v_dit)
+        return dict(describe())
     encoder_attention = dit.encoder_blocks[0].attn
     decoder_attention = dit.decoder_blocks[0].attn
     return {
@@ -505,6 +508,45 @@ def load_frozen_stage1(config: Mapping[str, Any], paths: ProjectPaths, device: t
         adapter_metadata,
         precision=stage1_precision,
     ), payload
+
+
+STAGE1_TYPES = ("vrae", "wan22_vae")
+
+
+def stage1_type(config: Mapping[str, Any]) -> str:
+    """``stage1.type``: the frozen latent space. ``vrae`` (the default) or ``wan22_vae``."""
+
+    value = str((config.get("stage1") or {}).get("type", "vrae"))
+    if value not in STAGE1_TYPES:
+        raise ValueError(f"stage1.type must be one of {STAGE1_TYPES}, got {value!r}")
+    return value
+
+
+def load_frozen_latent_backend(config: Mapping[str, Any], paths: ProjectPaths, device: torch.device):
+    """The frozen stage 1 selected by ``stage1.type``: ``(backend, checkpoint payload or None)``.
+
+    ``vrae`` is exactly ``load_frozen_stage1``. ``wan22_vae`` loads the Wan2.2 VAE from
+    ``stage1.checkpoint`` (fp32, official normalization) for the square ``data.image_size``.
+    """
+
+    kind = stage1_type(config)
+    if kind == "vrae":
+        return load_frozen_stage1(config, paths, device)
+    from vrae.models.video_vae.backend import load_wan22_backend
+
+    stage1 = config["stage1"]
+    image_size = (config.get("data") or {}).get("image_size", 256)
+    if isinstance(image_size, (list, tuple)):
+        if len(image_size) != 2 or int(image_size[0]) != int(image_size[1]):
+            raise ValueError("data.image_size must be square")
+        image_size = image_size[0]
+    backend = load_wan22_backend(
+        paths.checkpoint(stage1["checkpoint"]),
+        image_size=int(image_size),
+        precision=str(stage1.get("precision", "fp32")),
+        revision=stage1.get("revision"),
+    )
+    return backend.to(device), None
 
 
 def compute_class_conditional_latent_stats(

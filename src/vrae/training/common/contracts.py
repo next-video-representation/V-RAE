@@ -111,12 +111,35 @@ def resolve_checkpoint_interval_steps(training: Mapping[str, Any], *, steps_per_
     return step_interval
 
 
+# The latent definition of a Wan2.2 VAE stage 1 (vrae.models.video_vae.backend.metadata()).
+WAN22_STAGE1_STRUCTURE_FIELDS = (
+    "type",
+    "revision",
+    "weights_sha256",
+    "latent_channels",
+    "spatial_compression",
+    "temporal_compression",
+    "latent_grid",
+    "normalization",
+    "posterior",
+    "dtype",
+)
+
+
+def stage1_structure_fields(metadata: Mapping[str, Any]) -> tuple[str, ...]:
+    """The latent-definition fields of this stage-1 backend (V-RAE unless ``type`` says otherwise)."""
+
+    if metadata.get("type") == "wan22_vae":
+        return WAN22_STAGE1_STRUCTURE_FIELDS
+    return STAGE1_STRUCTURE_FIELDS
+
+
 def structural_stage1_metadata(metadata: Mapping[str, Any]) -> dict[str, Any]:
     """Return only latent-definition fields, excluding runtime decoder provenance."""
 
     return {
         field: copy.deepcopy(metadata[field])
-        for field in STAGE1_STRUCTURE_FIELDS
+        for field in stage1_structure_fields(metadata)
         if field in metadata
     }
 

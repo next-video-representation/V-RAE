@@ -1,5 +1,9 @@
 """Per-channel statistics of the train-split future latents (never the first frame).
 
+With a Wan2.2 VAE stage 1 the future latents come from the joint 17-frame encoding, and the same
+statistics normalize the first-frame latent z0 the DiT reads. The per-channel mean/std of z0 over
+the same clips is recorded in the metadata (``condition_latent``) for comparison only.
+
 The normalizer records what it was fit on: the stage-1 structure and checkpoint,
 the identity of every train manifest (configured path, SHA-256 and clip count
 from its ``meta.yaml``), the image size and preprocessing, the frame protocol,
@@ -23,7 +27,7 @@ from vrae.config import load_config
 from vrae.paths import ProjectPaths, find_project_root, load_project_paths
 from vrae.training.common.contracts import structural_stage1_metadata
 from vrae.training.common.distributed import initialize_distributed
-from vrae.training.common.engine import load_frozen_stage1
+from vrae.training.common.engine import load_frozen_latent_backend, load_frozen_stage1, stage1_type
 from vrae.training.common.latent_norm import (
     DistributedLatentStats,
     LatentNormalizer,
@@ -38,7 +42,11 @@ from vrae.training.nanovvm_video_pred.data import (
     frame_protocol_metadata,
     resolve_split_sources,
 )
-from vrae.training.nanovvm_video_pred.latents import encode_future
+from vrae.training.nanovvm_video_pred.latents import (
+    encode_condition_and_future,
+    encode_future,
+    is_wan_backend,
+)
 from vrae.training.nanovvm_video_pred.manifest import read_meta
 
 FUTURE_RELATIVE_FRAMES = [1, 16]
@@ -93,7 +101,9 @@ def normalizer_context(
         "normalized": False,
         "stage1": structural_stage1_metadata(stage1_metadata),
         "stage1_checkpoint": str(config["stage1"]["checkpoint"]),
-        "stage1_weights": str(config["stage1"].get("weights", "ema")),
+        "stage1_weights": str(
+            config["stage1"].get("weights", "ema" if stage1_type(config) == "vrae" else "official")
+        ),
         "stage1_precision": str(config["stage1"].get("precision", "fp32")),
         "train_sources": sources,
         "train_sources_sha256": identity_digest(sources),
@@ -142,9 +152,17 @@ def validate_nanovvm_normalizer(
             "NanoVVM future normalizer was fit on different data or stage-1 settings; delete it "
             "or point latent_normalizer.path elsewhere:\n" + "\n".join(mismatches)
         )
-    channels = int(stage1_metadata["hidden_size"])
+    channels = latent_width(stage1_metadata)
     if normalizer.mean.numel() != channels:
         raise ValueError(f"normalizer has {normalizer.mean.numel()} channels, expected {channels}")
+
+
+def latent_width(stage1_metadata: Mapping[str, Any]) -> int:
+    """Channels of the stage-1 latents: V-RAE hidden_size or Wan2.2 latent_channels."""
+
+    if stage1_metadata.get("type") == "wan22_vae":
+        return int(stage1_metadata["latent_channels"])
+    return int(stage1_metadata["hidden_size"])
 
 
 def fit_subset_indices(population: int, clips: object, seed: int) -> list[int]:
@@ -163,8 +181,12 @@ def fit_subset_indices(population: int, clips: object, seed: int) -> list[int]:
 
 def compute_nanovvm_latent_stats(config: Mapping[str, Any], paths: ProjectPaths) -> Path | None:
     distributed = initialize_distributed()
-    stage1, _ = load_frozen_stage1(config, paths, distributed.device)
+    if stage1_type(config) == "vrae":
+        stage1, _ = load_frozen_stage1(config, paths, distributed.device)
+    else:
+        stage1, _ = load_frozen_latent_backend(config, paths, distributed.device)
     stage1_metadata = stage1.metadata()
+    wan = is_wan_backend(stage1)
     dataset = build_nanovvm_dataset(config, paths, split="train")
     settings = config["latent_normalizer"]
     selected = fit_subset_indices(
@@ -181,15 +203,24 @@ def compute_nanovvm_latent_stats(config: Mapping[str, Any], paths: ProjectPaths)
         pin_memory=bool(config["training"].get("pin_memory", True)),
         collate_fn=collate_nanovvm,
     )
-    accumulator = DistributedLatentStats(
-        int(stage1_metadata["hidden_size"]), device=distributed.device
-    )
+    channels = latent_width(stage1_metadata)
+    accumulator = DistributedLatentStats(channels, device=distributed.device)
+    # Wan2.2: z0's own statistics, recorded for comparison (z0 is normalized with the future's).
+    condition_accumulator = DistributedLatentStats(channels, device=distributed.device) if wan else None
     shape: list[int] | None = None
     with torch.no_grad():
         for index, batch in enumerate(loader):
-            future = encode_future(
-                stage1, batch["future"].to(distributed.device, non_blocking=True)
-            )
+            if wan:
+                condition, future = encode_condition_and_future(
+                    stage1,
+                    batch["condition"].to(distributed.device, non_blocking=True),
+                    batch["future"].to(distributed.device, non_blocking=True),
+                )
+                condition_accumulator.update(condition[:, None])
+            else:
+                future = encode_future(
+                    stage1, batch["future"].to(distributed.device, non_blocking=True)
+                )
             shape = list(future.shape[1:])
             accumulator.update(future)
             if distributed.is_main and index % 50 == 0:
@@ -209,6 +240,15 @@ def compute_nanovvm_latent_stats(config: Mapping[str, Any], paths: ProjectPaths)
         "seed": int(settings.get("fit_seed", 0)),
         "selection": "all" if len(selected) == len(dataset) else "seeded_uniform_subset",
     }
+    if condition_accumulator is not None:
+        condition_stats = condition_accumulator.finalize()
+        metadata["condition_latent"] = {
+            "scope": "first_frame_z0",
+            "relative_frame": 0,
+            "use": "recorded only; the DiT input z0 is normalized with the future statistics",
+            "mean": [float(value) for value in condition_stats.mean.tolist()],
+            "std": [float(value) for value in condition_stats.std.tolist()],
+        }
     normalizer = accumulator.finalize(metadata=metadata)
     if not distributed.is_main:
         return None
@@ -238,6 +278,7 @@ if __name__ == "__main__":
 __all__ = [
     "compute_nanovvm_latent_stats",
     "fit_subset_indices",
+    "latent_width",
     "normalizer_context",
     "train_source_identity",
     "validate_nanovvm_normalizer",

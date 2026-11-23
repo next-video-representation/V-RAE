@@ -14,6 +14,10 @@ Each output ``.pt`` holds ``predicted_future`` ``[16,3,H,W]`` (decoded V-RAE
 output), ``condition_rgb`` ``[3,H,W]``, and ``display17`` ``[17,3,H,W]``, which
 is only a visualization (first frame followed by the 16 predicted frames).
 Val samples also store ``real_future_rgb`` = RGB clip[1:17] for metrics.
+
+With a Wan2.2 VAE stage 1 (``stage1.type: wan22_vae``) the first frame is encoded alone to the raw
+latent z0 (equal to latent 0 of a 17-frame encoding); the DiT reads z0 normalized with the task's
+statistics, and the decoder renders the 16 frames from the raw z0 followed by the sampled latents.
 """
 
 from __future__ import annotations
@@ -34,7 +38,12 @@ from vrae.evaluation.common.population import sample_seed
 from vrae.models.dit.transport import FlowMatchingTransport
 from vrae.paths import ProjectPaths, find_project_root, load_project_paths
 from vrae.training.common.ema import ExponentialMovingAverage
-from vrae.training.common.engine import build_flow_transport, load_frozen_stage1
+from vrae.training.common.engine import (
+    build_flow_transport,
+    load_frozen_latent_backend,
+    load_frozen_stage1,
+    stage1_type,
+)
 from vrae.training.common.latent_norm import LatentNormalizer
 from vrae.training.nanovvm_video_pred.data import (
     IMAGE_SIZE,
@@ -46,7 +55,11 @@ from vrae.training.nanovvm_video_pred.data import (
     decode_clip_frames,
     spatial_preprocess,
 )
-from vrae.training.nanovvm_video_pred.latents import decode_future_tokens, encode_first_frame
+from vrae.training.nanovvm_video_pred.latents import (
+    condition_features,
+    decode_future_tokens,
+    encode_first_frame,
+)
 
 
 def deterministic_future_noise(
@@ -138,7 +151,8 @@ def sample_from_first_frame(
 ) -> torch.Tensor:
     """RGB first frames ``[B,3,H,W]`` -> decoded future RGB ``[B,16,3,H,W]``."""
 
-    frame_features = encode_first_frame(stage1, condition_rgb)
+    raw_condition = encode_first_frame(stage1, condition_rgb)
+    frame_features = condition_features(stage1, raw_condition, normalizer)
     tokens = predict_future_tokens(
         dit,
         frame_features,
@@ -150,7 +164,9 @@ def sample_from_first_frame(
         cfg_scale=cfg_scale,
         internal_guidance_scale=internal_guidance_scale,
     )
-    return decode_future_tokens(stage1, tokens, grid_size=tuple(dit.grid_size))
+    return decode_future_tokens(
+        stage1, tokens, grid_size=tuple(dit.grid_size), condition=raw_condition
+    )
 
 
 def load_sampling_stack(
@@ -167,7 +183,10 @@ def load_sampling_stack(
         nanovvm_model_metadata,
     )
 
-    stage1, _ = load_frozen_stage1(config, paths, device)
+    if stage1_type(config) == "vrae":
+        stage1, _ = load_frozen_stage1(config, paths, device)
+    else:
+        stage1, _ = load_frozen_latent_backend(config, paths, device)
     dit = build_nanovvm_dit(config, stage1.metadata()).to(device)
     normalizer = load_task_normalizer(
         config, paths, stage1_metadata=stage1.metadata(), device=device
@@ -360,6 +379,7 @@ __all__ = [
     "deterministic_future_noise",
     "load_first_frame_from_video",
     "load_first_frame_image",
+    "condition_features",
     "load_sampling_stack",
     "predict_future_tokens",
     "sample_from_first_frame",
