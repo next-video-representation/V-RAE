@@ -739,8 +739,9 @@ new path, and V-RAE configs (no `stage1.type`, i.e. `vrae`) are unchanged.
 
 - **Latents.** Wan2.2 VAE of Wan-AI/Wan2.2-TI2V-5B (`Wan2.2_VAE.pth`; source vendored from
   Wan-Video/Wan2.2@1ea34ff, `src/vrae/models/video_vae/wan22.py`): 16x spatial, 4x temporal, 48
-  channels, posterior mean, Wan's official per-channel normalization, fp32 with TF32 and autocast
-  off. 128x128 gives an 8x8 latent grid.
+  channels, posterior mean, Wan's official per-channel normalization, `stage1.precision: bf16`
+  (bf16 autocast with fp32 weights, as the V-RAE configs; `fp32` runs it in fp32 with TF32 off,
+  about 11x slower on an A100). 128x128 gives an 8x8 latent grid.
 - **Joint, causal encoding.** Frame 0 and the 16 future frames are encoded as one 17-frame clip
   (the encoder silently drops frames beyond 4n+1, so any other length is rejected): latent 0 is
   the condition `z0`, latents 1..4 are the target `[B,4,64,48]`. The VAE is causal: `z0` equals
@@ -789,7 +790,7 @@ checkpointing. The Wan DiT reads 320 tokens (64 of them `z0`), the V-RAE DDT 256
 ### Configuration
 
 ```text
-configs/models/wan22_vae.yaml                stage1: {type: wan22_vae, checkpoint, revision, precision: fp32}
+configs/models/wan22_vae.yaml                stage1: {type: wan22_vae, checkpoint, revision, precision: bf16}
 configs/models/dit_wan_ti2v.yaml             dit: {name: wan_ti2v_dit, ...}
 configs/training/nanovvm_video_pred/
   _wan22_common.yaml                         stage 1, DiT, transport (shift sqrt(3)), data at 128, sampling
@@ -873,8 +874,9 @@ because the end-to-end test keeps its tiny model on the CPU. They cover:
   mp4s, cached controls and features on a later step, the same noise per clip, and the caller's RNG;
 - for the Wan2.2 path (`test_nanovvm_wan22.py`; a narrow random `WanVAE_` at 32x32, no weights): the
   loader's VAE config and official normalization, the causal `z0` (equal to frame 0 alone, unchanged
-  by the future), rejection of clips other than 17 frames, causal decoding with `z0`, fp32 under an
-  outer autocast; the DiT against a literal port of Wan2.2's forward, `z0` at t = 0, the null `z0`,
+  by the future), rejection of clips other than 17 frames, causal decoding with `z0`, the VAE's own
+  precision (fp32, or bf16 autocast on CUDA) under an outer autocast;
+  the DiT against a literal port of Wan2.2's forward, `z0` at t = 0, the null `z0`,
   aliases, the base head, exact gradient checkpointing, and the transport; the ladder's parameter
   counts and the 5B formula; the six configs (`--build-only`, shift sqrt(3), equality with the
   EUPE res128 twins, rejected settings); statistics, train, resume and sampling end to end; and the

@@ -244,8 +244,8 @@ def validate_build(config: Mapping[str, Any]) -> dict[str, Any]:
         stage1 = config["stage1"]
         if not str(stage1.get("checkpoint", "")):
             raise ValueError("stage1.checkpoint must name Wan2.2_VAE.pth")
-        if str(stage1.get("precision", "fp32")) != "fp32":
-            raise ValueError("stage1.precision must be fp32 for the Wan2.2 VAE")
+        if str(stage1.get("precision", "fp32")) not in ("fp32", "bf16"):
+            raise ValueError("stage1.precision must be fp32 or bf16 for the Wan2.2 VAE")
         if str(stage1.get("revision", WAN22_REVISION)) != WAN22_REVISION:
             raise ValueError(f"stage1.revision must be the vendored Wan2.2 commit {WAN22_REVISION}")
     dit = config["dit"]

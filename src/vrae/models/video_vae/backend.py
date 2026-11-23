@@ -13,9 +13,12 @@ latent k >= 1 depends on frames <= 4k. Its encoder silently drops frames beyond 
   and frame 0 of the 17 decoded frames is dropped. ``z0`` here is the raw latent (Wan's official
   per-channel normalization applied), never the task-normalized one.
 
-Latents are posterior means with Wan's official normalization ``(mu - mean) / std``. Encoding and
-decoding run in fp32 with TF32 off and any outer autocast disabled. Token layout matches
-``VRAELatentAdapter``: ``[B, T, h*w, C]``, row-major over the latent grid.
+Latents are posterior means with Wan's official normalization ``(mu - mean) / std``. The weights
+stay fp32; ``precision`` (``stage1.precision``) sets the compute: ``bf16`` runs the VAE under bf16
+autocast on CUDA (as V-RAE's ``stage1.precision: bf16``; fp32 on the CPU, like
+``VRAELatentAdapter``), ``fp32`` runs it in fp32 with TF32 off. Either way the caller's autocast is
+replaced and the latents/RGB are returned as fp32. Token layout matches ``VRAELatentAdapter``:
+``[B, T, h*w, C]``, row-major over the latent grid.
 """
 
 from __future__ import annotations
@@ -37,16 +40,26 @@ SPATIAL_COMPRESSION = 16
 TEMPORAL_COMPRESSION = 4
 
 
-@contextmanager
-def vae_precision(device_type: str):
-    """fp32 VAE inference regardless of the caller's TF32 and autocast state (nanovvm wrapper)."""
+PRECISIONS = {"fp32": "float32", "bf16": "bfloat16"}  # stage1.precision -> metadata dtype
 
+
+@contextmanager
+def vae_precision(device_type: str, precision: str = "fp32"):
+    """VAE compute independent of the caller's TF32 and autocast state (nanovvm wrapper): fp32 with
+    TF32 off, or bf16 autocast on CUDA (fp32 elsewhere)."""
+
+    if precision not in PRECISIONS:
+        raise ValueError(f"Wan2.2 VAE precision must be one of {sorted(PRECISIONS)}, got {precision!r}")
     flags = torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32
     try:
         torch.backends.cuda.matmul.allow_tf32 = False
         torch.backends.cudnn.allow_tf32 = False
         with torch.autocast(device_type=device_type, enabled=False):
-            yield
+            if precision == "bf16" and device_type == "cuda":
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    yield
+            else:
+                yield
     finally:
         torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32 = flags
 
@@ -92,8 +105,12 @@ class Wan22LatentBackend(nn.Module):
         image_size: int,
         weights_sha256: str,
         revision: str = WAN22_REVISION,
+        precision: str = "fp32",
     ) -> None:
         super().__init__()
+        if str(precision) not in PRECISIONS:
+            raise ValueError(f"Wan2.2 VAE precision must be one of {sorted(PRECISIONS)}, got {precision!r}")
+        self.precision = str(precision)
         image_size = int(image_size)
         if image_size <= 0 or image_size % SPATIAL_COMPRESSION:
             raise ValueError(f"image_size must be a positive multiple of {SPATIAL_COMPRESSION}")
@@ -137,7 +154,7 @@ class Wan22LatentBackend(nn.Module):
                 f"got {video.shape[1]} frames (its encoder would silently drop frames beyond 4n+1)"
             )
         x = _unit_rgb(video).mul(2).sub(1).permute(0, 2, 1, 3, 4).contiguous()  # [B,3,T,H,W]
-        with vae_precision(x.device.type):
+        with vae_precision(x.device.type, self.precision):
             z = self.model.encode(x, self._scale)
         return z.float().permute(0, 2, 3, 4, 1).flatten(2, 3).contiguous()
 
@@ -184,13 +201,18 @@ class Wan22LatentBackend(nn.Module):
         latents = torch.cat((condition_latent[:, None], future_latent), dim=1).float()
         batch, frames = latents.shape[:2]
         z = latents.reshape(batch, frames, *self.grid_size, LATENT_CHANNELS).permute(0, 4, 1, 2, 3)
-        with vae_precision(z.device.type):
+        with vae_precision(z.device.type, self.precision):
             video = self.model.decode(z.contiguous(), self._scale)
         video = video.float().clamp(-1, 1).add(1).mul(0.5).permute(0, 2, 1, 3, 4)
         return video[:, 1:].contiguous()
 
     def decoder_execution_metadata(self) -> dict[str, Any]:
-        return {"backend": BACKEND_TYPE, "dtype": "float32", "tf32": False, "autocast": False}
+        return {
+            "backend": BACKEND_TYPE,
+            "dtype": PRECISIONS[self.precision],
+            "tf32": False,
+            "autocast": "bf16_cuda" if self.precision == "bf16" else False,
+        }
 
     def metadata(self) -> dict[str, Any]:
         return {
@@ -203,7 +225,7 @@ class Wan22LatentBackend(nn.Module):
             "latent_grid": list(self.grid_size),
             "normalization": "official",
             "posterior": "mean",
-            "dtype": "float32",
+            "dtype": PRECISIONS[self.precision],
         }
 
 
@@ -218,8 +240,8 @@ def load_wan22_backend(
 
     from vrae.models.video_vae.wan22 import Wan2_2_VAE
 
-    if str(precision) != "fp32":
-        raise ValueError("stage1.precision must be fp32 for the Wan2.2 VAE")
+    if str(precision) not in PRECISIONS:
+        raise ValueError(f"stage1.precision must be fp32 or bf16 for the Wan2.2 VAE, got {precision!r}")
     if revision is not None and str(revision) != WAN22_REVISION:
         raise ValueError(
             f"stage1.revision {revision!r} does not match the vendored Wan2.2 VAE ({WAN22_REVISION})"
@@ -233,6 +255,7 @@ def load_wan22_backend(
         reference.scale,
         image_size=image_size,
         weights_sha256=file_sha256(path),
+        precision=str(precision),
     )
 
 

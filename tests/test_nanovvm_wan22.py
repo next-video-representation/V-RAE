@@ -100,7 +100,9 @@ def tiny_wan_vae(seed: int = 0) -> torch.nn.Module:
     ).eval()
 
 
-def load_tiny_backend(weights: Path, *, image_size: int = 32, seed: int = 0) -> Wan22LatentBackend:
+def load_tiny_backend(
+    weights: Path, *, image_size: int = 32, seed: int = 0, precision: str = "fp32"
+) -> Wan22LatentBackend:
     """load_wan22_backend with the official Wan2_2_VAE wrapper; only _video_vae is replaced."""
 
     model = tiny_wan_vae(seed)
@@ -111,7 +113,9 @@ def load_tiny_backend(weights: Path, *, image_size: int = 32, seed: int = 0) -> 
         return model
 
     with mock.patch.object(wan22, "_video_vae", video_vae):
-        backend = load_wan22_backend(weights, image_size=image_size, revision=WAN22_REVISION)
+        backend = load_wan22_backend(
+            weights, image_size=image_size, revision=WAN22_REVISION, precision=precision
+        )
     assert calls and calls[0]["pretrained_path"] == str(weights)
     backend.loader_call = calls[0]
     return backend
@@ -279,8 +283,8 @@ class Wan22BackendTest(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "revision"):
             load_wan22_backend(self.weights, image_size=32, revision="main")
-        with self.assertRaisesRegex(ValueError, "fp32"):
-            load_wan22_backend(self.weights, image_size=32, precision="bf16")
+        with self.assertRaisesRegex(ValueError, "fp32 or bf16"):
+            load_wan22_backend(self.weights, image_size=32, precision="fp16")
 
     def test_z0_is_causal_and_the_future_sees_frame_0(self):
         z0, future = self.backend.encode_clip(self.condition, self.future)
@@ -340,6 +344,27 @@ class Wan22BackendTest(unittest.TestCase):
         self.assertTrue(torch.equal(plain[0], inside[0]) and torch.equal(plain[1], inside[1]))
         self.assertEqual(decoded.dtype, torch.float32)
         self.assertTrue(torch.equal(decoded, self.backend.decode_future(*plain)))
+
+    def test_bf16_precision(self):
+        bf16 = load_tiny_backend(self.weights, precision="bf16")
+        self.assertEqual(bf16.metadata()["dtype"], "bfloat16")
+        self.assertEqual(bf16.decoder_execution_metadata()["autocast"], "bf16_cuda")
+        self.assertEqual(next(bf16.model.parameters()).dtype, torch.float32)  # fp32 weights
+        # bf16 autocast applies on CUDA only; on the CPU it computes exactly the fp32 latents.
+        z0, future = bf16.encode_clip(self.condition, self.future)
+        reference = self.backend.encode_clip(self.condition, self.future)
+        self.assertTrue(torch.equal(z0, reference[0]) and torch.equal(future, reference[1]))
+        if not torch.cuda.is_available():
+            return
+        fp32, bf16 = self.backend.cuda(), bf16.cuda()
+        condition, clip = self.condition.cuda(), self.future.cuda()
+        exact = fp32.encode_clip(condition, clip)
+        with torch.autocast("cuda", dtype=torch.float16):  # the caller's autocast is replaced
+            approx = bf16.encode_clip(condition, clip)
+        self.assertEqual(approx[1].dtype, torch.float32)
+        relative = (approx[1] - exact[1]).norm() / exact[1].norm()
+        self.assertTrue(0 < relative.item() < 0.05)
+        self.backend.cpu()
 
     def test_condition_features_use_the_task_normalizer(self):
         z0, _ = self.backend.encode_clip(self.condition, self.future)
@@ -589,7 +614,7 @@ class WanConfigTest(unittest.TestCase):
                 self.assertEqual(
                     config["stage1"],
                     {"type": "wan22_vae", "checkpoint": "ckpts/pretrained/wan22_vae/Wan2.2_VAE.pth",
-                     "revision": WAN22_REVISION, "precision": "fp32"},
+                     "revision": WAN22_REVISION, "precision": "bf16"},
                 )
                 for section in ("training", "data", "sampling", "fvd"):
                     self.assertEqual(config[section], eupe[section], section)
@@ -604,7 +629,7 @@ class WanConfigTest(unittest.TestCase):
                 self.assertEqual(config["dit"]["frame_dropout"], eupe["dit"]["frame_dropout"])
                 self.assertEqual(
                     config["latent_normalizer"],
-                    {"path": "ckpts/nanovvm_video_pred/latent_stats/wan22_mix5_cond1gen16_res128_future_fp32.pt",
+                    {"path": "ckpts/nanovvm_video_pred/latent_stats/wan22_mix5_cond1gen16_res128_future_bf16.pt",
                      "fit_clips": 20000, "fit_seed": 0, "batch_size": 16},
                 )
                 self.assertEqual(
@@ -639,7 +664,7 @@ class WanConfigTest(unittest.TestCase):
         for mutate, match in (
             (lambda c: c["transport"].update(time_dist_shift=6.928203230275509), "time_dist_shift"),
             (lambda c: c["data"].update(image_size=120), "16x"),
-            (lambda c: c["stage1"].update(precision="bf16"), "fp32"),
+            (lambda c: c["stage1"].update(precision="fp16"), "fp32 or bf16"),
             (lambda c: c["stage1"].update(revision="main"), "revision"),
             (lambda c: c.update(model={"encoder": {"name": "eupe"}}), "no V-RAE model section"),
             (lambda c: c["dit"].update(patch_size=[2, 1, 1]), r"\[1, p_h, p_w\]"),
@@ -708,7 +733,10 @@ class WanEndToEndTest(unittest.TestCase):
             config = wan_task_config()
             config["wandb"] = bind_wandb_run_name(config["wandb"], config["run_name"])
             nv_train.validate_build(config)
-            backend = load_tiny_backend(paths.checkpoint(config["stage1"]["checkpoint"]))
+            backend = load_tiny_backend(
+                paths.checkpoint(config["stage1"]["checkpoint"]), precision=config["stage1"]["precision"]
+            )
+            self.assertEqual(backend.metadata()["dtype"], "bfloat16")
             loader = mock.Mock(return_value=(backend, None))
             with (
                 mock.patch.object(latent_stats, "load_frozen_latent_backend", loader),
