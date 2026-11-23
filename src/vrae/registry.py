@@ -50,6 +50,7 @@ def register_builtin_models() -> None:
         "vrae.models.dit.video_dit",
         "vrae.models.dit.video_prediction_dit",
         "vrae.models.dit.first_frame_prediction_dit",
+        "vrae.models.dit.wan_ti2v_dit",
         "vrae.models.encoders.dinov3",
         "vrae.models.encoders.eupe",
         "vrae.models.encoders.siglip2",
