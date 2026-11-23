@@ -1,0 +1,11 @@
+# Wan2.2 VAE as the frozen stage 1 of nanovvm_video_pred (vrae.models.video_vae.backend).
+# Wan2_2_VAE(z_dim=48, c_dim=160, dim_mult=[1,2,4,4], temperal_downsample=[False,True,True]) of
+# Wan-AI/Wan2.2-TI2V-5B: 2x2 pixel patchify + three stride-2 stages, i.e. 16x spatial, 4x temporal,
+# 48 channels, posterior mean with Wan's official per-channel normalization, fp32 (TF32 and
+# autocast off). Source: Wan-Video/Wan2.2 at `revision`, wan/modules/vae2_2.py (vendored).
+# The weights are a symlink, ckpts/pretrained/wan22_vae/Wan2.2_VAE.pth -> Wan2.2-TI2V-5B/Wan2.2_VAE.pth.
+stage1:
+  type: wan22_vae
+  checkpoint: ckpts/pretrained/wan22_vae/Wan2.2_VAE.pth
+  revision: 1ea34ff48f87168174e12956e200b1d908b1c5ff
+  precision: fp32

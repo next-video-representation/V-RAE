@@ -1,0 +1,62 @@
+# Shared settings of the Wan2.2 VAE + Wan2.2-TI2V DiT NanoVVM first-frame -> 16-frame configs.
+# Not runnable on its own: wan22_mix5.yaml adds run_name, latent_normalizer and data.train/val.
+# The counterpart of _eupe_common.yaml: transport, training, data (except image_size), sampling and
+# wandb are copied from it unchanged; no V-RAE model section is included.
+#   stage1   the frozen Wan2.2 VAE (../../models/wan22_vae.yaml), stage1.type: wan22_vae. Frame 0
+#            and the 16 future frames are encoded as one 17-frame clip: latent 0 = z0 (condition),
+#            latents 1..4 = the target; decoding renders z0 + the 4 latents and drops frame 0.
+#   dit      wan_ti2v_dit (../../models/dit_wan_ti2v.yaml).
+#   data     128x128: the Wan2.2 VAE gives an 8x8 latent grid (16x compression).
+include:
+  - ../../models/wan22_vae.yaml
+  - ../../models/dit_wan_ti2v.yaml
+task: nanovvm_video_pred
+transport:
+  prediction: x
+  time_dist_type: logit-normal_0_1
+  # sqrt(future_chunks * h * w * C / 4096) = sqrt(4 * 8 * 8 * 48 / 4096) = sqrt(3) at 128x128
+  # (train.py derives it from the latent grid and requires the config to match).
+  time_dist_shift: 1.7320508075688772
+  t_eps: 0.05
+  base_model_coeff: 1.0
+training:
+  resume: null
+  init_from: null
+  global_batch_size: 64
+  gradient_accumulation_steps: 1
+  epochs: 1
+  checkpoint_interval: 5000
+  precision: bf16
+  num_workers: 8
+  optimizer: {name: adamw, lr: 1.0e-4, betas: [0.9, 0.95], weight_decay: 0.05}
+  scheduler: {name: constant, warmup_steps: 0}
+  ema: {decay: 0.9995}
+data:
+  dataset: nanovvm
+  # null: use datasets.nanovvm from the --paths file. An absolute path (or one relative to
+  # the repository root) overrides it. Source paths below are relative to this root.
+  data_root: null
+  # NanoVVM cond1gen16_interval3: source frames s + 3k, k = 0..16; frame 0 conditions,
+  # frames 1..16 (s+3 ... s+48) are the prediction target.
+  rgb_seq_len: 17
+  frame_interval: 3
+  condition_frames: 1
+  future_frames: 16
+  image_size: 128
+  preprocessing:
+    horizontal_flip_prob: 0.0
+    resize: {mode: short_side, interpolation: bilinear, antialias: false}
+    crop: {mode: center}
+  video_decoder: decord
+  seed: 3407
+  fps: 10
+sampling: {base_seed: 3407, steps: 100, cfg_scale: 1.0, internal_guidance_scale: 1.0}
+wandb:
+  project: V-RAE
+  group: nanovvm_video_prediction
+  tags: [nanovvm, video_prediction, first_frame, wan22_vae, wan_ti2v_dit]
+  mode: offline
+  resume: allow
+  log_interval: 20
+  sample_interval: 1000
+  sample_count: 2

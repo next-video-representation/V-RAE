@@ -554,7 +554,10 @@ class LadderConfigTest(unittest.TestCase):
         self.assertEqual(
             files, sorted(["_mix5_common.yaml", "_mix5_recipe.yaml"]
                           + [str(ladder_path(size).relative_to(LADDER)) for size in SIZES]
-                          + [str(ladder_res128_path(size).relative_to(LADDER)) for size in SIZES])
+                          + [str(ladder_res128_path(size).relative_to(LADDER)) for size in SIZES]
+                          # Wan2.2 VAE + Wan2.2-TI2V DiT twins (tests/test_nanovvm_wan22.py)
+                          + [f"{size}/wan22_ti2v_mix5_{size}_xpred_interval3_cond1gen16_res128_bs32_lr2e-4_wd0_ep1.yaml"
+                             for size in SIZES])
         )
 
     def test_res128_variants(self):

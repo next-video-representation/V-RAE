@@ -1,0 +1,17 @@
+# Wan2.2-TI2V DiT for first-frame conditioned prediction (vrae.models.dit.wan_ti2v_dit): the clean
+# first-frame latent z0 is latent frame 0 of the sequence at t = 0, the noisy future latents are
+# frames 1..4; Wan2.2's blocks without text cross-attention. grid_size, in_channels/frame_channels
+# and future_chunks are derived from the Wan2.2 VAE and data.image_size when the trainer builds the
+# model. The size keys (dim, ffn_dim, num_heads, num_layers, base_depth) default to Wan2.2-TI2V-5B
+# (3072, 14336, 24, 30, round(2*30/7) = 9); the scaling-ladder configs set them.
+# patch_size [1, 1, 1] at 128 px (8x8 latent grid, 64 tokens per latent frame); Wan's [1, 2, 2]
+# gives the same 64 tokens per frame at 256 px.
+dit:
+  name: wan_ti2v_dit
+  freq_dim: 256
+  eps: 1.0e-6
+  qk_norm: rms_norm_across_heads
+  rope_theta: 10000.0
+  patch_size: [1, 1, 1]
+  frame_dropout: 0.1
+  gradient_checkpointing: true

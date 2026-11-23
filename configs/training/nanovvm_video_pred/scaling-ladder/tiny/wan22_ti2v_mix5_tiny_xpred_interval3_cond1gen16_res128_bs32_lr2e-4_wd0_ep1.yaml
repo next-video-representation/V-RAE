@@ -1,0 +1,35 @@
+# mix5 scaling ladder, tiny: Wan2.2 VAE + Wan2.2-TI2V DiT at 128x128, global batch 32.
+# Wan2.2-TI2V-5B proportions (dim 3072, ffn_dim 14336, 24 heads, 30 layers):
+#   head_dim 128, so num_heads = dim / 128; ffn_dim = round(14/3 * dim / 128) * 128 (5B: 14336/3072 = 14/3);
+#   dim / num_layers ~ 102.4 (5B: 3072/30), with the layer count moved (85..107) to meet the parameter
+#   target; base_depth (internal-guidance head) = max(1, round(2L/7)) (V-RAE's encoder_depth/depth = 8/28).
+# tiny: dim 384 = 3 heads x 128, 4 layers, ffn_dim 1792, dim/L = 96.0, base_depth 1.
+# DiT parameters: 9.09M including the internal-guidance head and the null z0
+# (-8.2% vs NanoVVM tiny, 9.9M).
+# Data, transport (except time_dist_shift), optimization, EMA, CFG dropout, internal guidance, sampling
+# and FVD equal vrae_eupe_mix5_tiny_xpred_interval3_cond1gen16_res128_bs32_lr2e-4_wd0_ep1.yaml:
+#   data and latent_normalizer from ../../wan22_mix5.yaml; training, wandb and fvd from ../_mix5_recipe.yaml;
+#   then the 128x128 / batch-32 values below (2 GPUs x 16 clips, no accumulation).
+#   transport.time_dist_shift = sqrt(4 chunks * 8 * 8 * 48 / 4096) = sqrt(3) (V-RAE res128: sqrt(48)).
+# Lists are replaced, not merged, by includes, so wandb.tags is written out in full.
+include:
+  - ../../wan22_mix5.yaml
+  - ../_mix5_recipe.yaml
+run_name: wan22_ti2v_mix5_tiny_xpred_interval3_cond1gen16_res128_bs32_lr2e-4_wd0_ep1
+dit:
+  dim: 384
+  num_heads: 3
+  num_layers: 4
+  ffn_dim: 1792
+  base_depth: 1
+data:
+  image_size: 128
+fvd:
+  image_size: 128
+transport:
+  time_dist_shift: 1.7320508075688772
+training:
+  global_batch_size: 32
+  gradient_accumulation_steps: 1
+wandb:
+  tags: [nanovvm, video_prediction, first_frame, wan22_vae, wan_ti2v_dit, mix5, scaling_ladder, tiny, res128, bs32]
