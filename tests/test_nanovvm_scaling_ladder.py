@@ -552,7 +552,7 @@ class LadderConfigTest(unittest.TestCase):
     def test_layout(self):
         files = sorted(str(path.relative_to(LADDER)) for path in LADDER.rglob("*.yaml"))
         self.assertEqual(
-            files, sorted(["_mix5_common.yaml"]
+            files, sorted(["_mix5_common.yaml", "_mix5_recipe.yaml"]
                           + [str(ladder_path(size).relative_to(LADDER)) for size in SIZES]
                           + [str(ladder_res128_path(size).relative_to(LADDER)) for size in SIZES])
         )
