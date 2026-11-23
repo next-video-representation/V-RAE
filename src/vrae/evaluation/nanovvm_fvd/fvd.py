@@ -14,6 +14,11 @@ codebases. What differs is only how the compared videos are made:
 * static: the conditioning frame repeated 16 times, encoded and decoded by the frozen V-RAE
   (NanoVVM: the AE-decoded first frame repeated).
 
+The controls receive the conditioning frame as well (``reconstruct_future(future, condition_rgb)``):
+the V-RAE ignores it, while a causal video VAE (Wan2.2, ``stage1.type: wan22_vae``) encodes and
+decodes frame 0 followed by the 16 frames as one 17-frame clip and returns frames 1..16 (static:
+17 copies of frame 0). ``controls_only`` scores only real vs the controls, with no model.
+
 Every video is saved as 17 frames (the real conditioning frame first); with
 drop_conditioning_frames: 1 only frames 1..16 are scored, as in NanoVVM. Paths in the config are
 absolute here; vrae.training.nanovvm_video_pred.fvd resolves V-RAE's relative ones.
@@ -380,7 +385,8 @@ def _materialize(entry, protocol, predictor, cache_root, baselines, mp4_quality=
     for name in missing:
         future = frames[1:] if name == "ae_reconstruction" else condition[None].expand(
             protocol["num_frames"] - 1, -1, -1, -1)
-        reconstructed = predictor.reconstruct_future(future[None])[0].float().clamp(0, 1).cpu()
+        reconstructed = predictor.reconstruct_future(future[None], condition_rgb=condition[None])
+        reconstructed = reconstructed[0].float().clamp(0, 1).cpu()
         _save_video(torch.cat((condition[None], reconstructed)), paths[name], protocol["sample_fps"], mp4_quality)
     return condition, {name: str(path) for name, path in paths.items()}
 
@@ -397,13 +403,14 @@ def _save_feature(path, feature):
     temporary.replace(path)
 
 
-def _encoder_stats(shard, protocol, name, params, cache_root, device, baselines, groups=(None,)):
+def _encoder_stats(shard, protocol, name, params, cache_root, device, baselines, groups=(None,),
+                   include_model=True):
     """{group: {source: StreamingStats}} over this rank's shard (NanoVVM's implementation)."""
     if name == "vjepa2_1":
         encoder = VideoEncoder(name, params["checkpoint"], device, source_path=params.get("source_path"))
     else:
         encoder = VideoEncoder(name, params["checkpoint"], device)
-    sources = ("real", "model", *baselines)
+    sources = ("real", "model", *baselines) if include_model else ("real", *baselines)
     stats = {group: {source: StreamingStats(encoder.feature_dim) for source in sources} for group in groups}
     identity = {"name": name, "weights": weight_identity(params["checkpoint"]),
                 "upstream": UPSTREAM_REVISION if name == "videomaev2" else VJEPA21_REVISION if name == "vjepa2_1" else "legacy-i3d",
@@ -459,13 +466,14 @@ def _encoder_stats(shard, protocol, name, params, cache_root, device, baselines,
 
 @torch.no_grad()
 def run_fvd_evaluation(*, predictor, rank, world_size, device, run_dir, global_step, fvd_config,
-                       num_frames=17, frame_interval=3, model_name="model"):
+                       num_frames=17, frame_interval=3, model_name="model", controls_only=False):
     """Return flat W&B metric keys on rank zero, None elsewhere.
 
-    predictor: identity() -> dict (the frozen V-RAE, for cache keys); encode_condition(rgb [B,3,H,W])
+    predictor: identity() -> dict (the frozen stage 1, for cache keys); encode_condition(rgb [B,3,H,W])
     -> condition; generate(condition, sample_indices) -> future RGB [B,16,3,H,W] in [0,1];
-    reconstruct_future(rgb [B,16,3,H,W]) -> RGB [B,16,3,H,W]. The caller's RNG and TF32 state are
-    restored afterwards.
+    reconstruct_future(rgb [B,16,3,H,W], condition_rgb=[B,3,H,W]) -> RGB [B,16,3,H,W]. With
+    controls_only, no model video is generated and only the baselines are scored against real.
+    The caller's RNG and TF32 state are restored afterwards.
     """
     device = torch.device(device)
     metrics = {}
@@ -518,6 +526,15 @@ def run_fvd_evaluation(*, predictor, rank, world_size, device, run_dir, global_s
                     batch = shard[start:start + batch_size]
                     conditions, controls = zip(*[_materialize(e, protocol, predictor, cache_root, baselines,
                                                               options["mp4_quality"]) for e in batch])
+                    if controls_only:
+                        drop = options["drop_conditioning_frames"]
+                        for entry, baseline_paths in zip(batch, controls):
+                            local_manifest.append({**entry, "baselines": baseline_paths,
+                                                   "frame_interval": frame_interval,
+                                                   "frame_start": entry["frame_indices"][0] + drop * frame_interval,
+                                                   "gen_frame_start": drop, "num_frames": num_frames - drop,
+                                                   "conditioning_frames": 1})
+                        continue
                     condition = torch.stack(conditions)
                     future = predictor.generate(predictor.encode_condition(condition.to(device)),
                                                 [sample_index(e["video_id"]) for e in batch])
@@ -552,7 +569,7 @@ def run_fvd_evaluation(*, predictor, rank, world_size, device, run_dir, global_s
                 result = None
                 with phase(f"{split_name}/{name} feature extraction"):
                     result = _encoder_stats(local_manifest, protocol, name, params, cache_root, device, baselines,
-                                            groups=tuple(datasets) or (None,))
+                                            groups=tuple(datasets) or (None,), include_model=not controls_only)
                 group_stats, encoder_identity = result
                 for per_source in group_stats.values():
                     for statistic in per_source.values():
@@ -573,7 +590,7 @@ def run_fvd_evaluation(*, predictor, rank, world_size, device, run_dir, global_s
                             control_path = cache_root / "scores" / f"{control_key}.json"
                             cached = json.loads(control_path.read_text()) if control_path.is_file() else {}
                             values = {}
-                            for source in ("model", *baselines):
+                            for source in (() if controls_only else ("model",)) + tuple(baselines):
                                 value = (cached[source] if source in cached
                                          else frechet_distance(*reference, *statistics[source].finalize()))
                                 values[source] = value
@@ -607,8 +624,10 @@ def run_fvd_evaluation(*, predictor, rank, world_size, device, run_dir, global_s
                                  "datasets": {dataset: {"num_videos": dataset_counts[dataset],
                                                         "scores": dataset_scores[dataset]}
                                               for dataset in datasets},
-                                 "conditioning_frames": {"model": 1, "static": 1,
-                                                         "ae_reconstruction": num_frames}})
+                                 "conditioning_frames": {
+                                     **({} if controls_only else {"model": 1}),
+                                     "static": 1, "ae_reconstruction": num_frames},
+                                 **({"controls_only": True} if controls_only else {})})
         with phase("evaluation complete"):
             pass
     return metrics if rank == 0 else None

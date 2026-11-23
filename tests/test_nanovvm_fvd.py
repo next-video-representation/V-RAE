@@ -72,7 +72,9 @@ class FakePredictor:
         self.generated_indices.extend(sample_indices)
         return condition[:, None].expand(-1, 16, -1, -1, -1).clone()
 
-    def reconstruct_future(self, future):
+    def reconstruct_future(self, future, condition_rgb=None):
+        # The engine passes the conditioning frame (a causal video VAE needs it): [B,3,H,W].
+        assert condition_rgb is not None and condition_rgb.shape == (future.shape[0], *future.shape[2:])
         self.reconstructions += 1
         return future.float().clone()
 
