@@ -727,11 +727,113 @@ position and W&B run all continue from the checkpoint.
 | xl | 19.5 GB | 1.29 TB |
 | xxl | 34.2 GB | 2.26 TB |
 
+## Wan2.2 VAE + TI2V DiT
+
+An ablation of the latent space and the DiT on the same task (cond1gen16, mix5, 128x128): the
+frozen V-RAE is replaced by the Wan2.2 VAE and the DDT by a DiT with Wan2.2-TI2V-5B's architecture
+and first-frame injection. Data, transport, optimization, EMA, CFG dropout, internal guidance,
+sampling, FVD and the training loop are the ones above; `stage1.type` and `dit.name` select the
+new path, and V-RAE configs (no `stage1.type`, i.e. `vrae`) are unchanged.
+
+### Protocol
+
+- **Latents.** Wan2.2 VAE of Wan-AI/Wan2.2-TI2V-5B (`Wan2.2_VAE.pth`; source vendored from
+  Wan-Video/Wan2.2@1ea34ff, `src/vrae/models/video_vae/wan22.py`): 16x spatial, 4x temporal, 48
+  channels, posterior mean, Wan's official per-channel normalization, fp32 with TF32 and autocast
+  off. 128x128 gives an 8x8 latent grid.
+- **Joint, causal encoding.** Frame 0 and the 16 future frames are encoded as one 17-frame clip
+  (the encoder silently drops frames beyond 4n+1, so any other length is rejected): latent 0 is
+  the condition `z0`, latents 1..4 are the target `[B,4,64,48]`. The VAE is causal: `z0` equals
+  frame 0 encoded alone and does not depend on the future, but the target does depend on frame
+  0's pixels (as in Wan2.2-TI2V; with V-RAE neither depends on the other). Decoding is causal too:
+  the raw `z0` is decoded with the 4 latents and frame 0 of the 17 outputs is dropped.
+- **First-frame injection (Wan2.2-TI2V `i2v`).** The DiT sequence is `[z0, x_t^1..x_t^4]`
+  (5 latent frames x 64 tokens = 320 tokens, RoPE time 0..4, full attention); the `z0` tokens use
+  t = 0 and the future tokens the transport's t (TI2V's per-token `mask2 * timestep`). The
+  transport noises and supervises only the future; `z0` is passed clean at every training and
+  sampling step (TI2V re-inserts the clean latent after every step); the DiT returns the future.
+- **Normalization.** The future latents get V-RAE's per-channel train statistics (20000 clips);
+  `z0` is normalized with the same statistics before the DiT. The statistics file also records
+  `z0`'s own mean/std (`metadata["condition_latent"]`) for comparison.
+- **CFG.** With probability `frame_dropout = 0.1`, `z0` is replaced by a learned null latent
+  `[1,1,64,48]` (zero-initialized; its tokens keep t = 0); `condition_drop_mask=True` is the
+  unconditional branch.
+- **Shift.** `sqrt(future_chunks*h*w*C/4096) = sqrt(4*8*8*48/4096) = sqrt(3)`.
+
+### DiT
+
+`wan_ti2v_dit` (`src/vrae/models/dit/wan_ti2v_dit.py`) is Wan2.2's `WanModel` (patch-embedding
+Conv3d, sinusoidal embedding of `1000 t` -> Linear-SiLU-Linear, shared `SiLU -> Linear(d, 6d)`,
+per-block `[1,6,d]` modulation in fp32, LayerNorm without affine, q/k RMSNorm across heads, 3D RoPE
+split 44/42/42 for head_dim 128, GELU(tanh) FFN, fp32 output head modulated by `e`, Wan's
+`init_weights`). Deliberate deviations: no text cross-attention / `norm3` / `text_embedding`;
+`patch_size` [1,1,1] at 128 px (64 tokens per frame, like Wan's [1,2,2] at 256 px); an independent
+internal-guidance head after block `max(1, round(2L/7))`; the null `z0`. A test checks the module
+against a literal port of `WanModel.forward` with per-token timesteps.
+
+Ladder (head_dim 128, `ffn_dim = round(14/3 * dim / 128) * 128`, dim/L near 3072/30):
+
+| size | heads | dim | layers | ffn_dim | base_depth | parameters | NanoVVM | TFLOP/step | V-RAE res128 TFLOP/step |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| tiny | 3 | 384 | 4 | 1792 | 1 | 9.09M | 9.9M | 0.49 | 0.44 |
+| small | 6 | 768 | 9 | 3584 | 3 | 75.35M | 78.8M | 4.36 | 3.85 |
+| medium | 10 | 1280 | 12 | 6016 | 3 | 275.73M | 265.7M | 16.2 | 12.8 |
+| large | 13 | 1664 | 16 | 7808 | 5 | 613.51M | 629.5M | 36.5 | 30.7 |
+| xl | 16 | 2048 | 21 | 9600 | 6 | 1209.04M | 1229.2M | 72.4 | 59.5 |
+| xxl | 20 | 2560 | 24 | 11904 | 7 | 2139.93M | 2124.1M | 128.6 | 104.8 |
+
+Parameters include the internal-guidance head and the null `z0`. TFLOP/step is forward + backward
+at global batch 32 (`torch.utils.flop_counter`), without the extra forward of gradient
+checkpointing. The Wan DiT reads 320 tokens (64 of them `z0`), the V-RAE DDT 256.
+
+### Configuration
+
+```text
+configs/models/wan22_vae.yaml                stage1: {type: wan22_vae, checkpoint, revision, precision: fp32}
+configs/models/dit_wan_ti2v.yaml             dit: {name: wan_ti2v_dit, ...}
+configs/training/nanovvm_video_pred/
+  _wan22_common.yaml                         stage 1, DiT, transport (shift sqrt(3)), data at 128, sampling
+  wan22_mix5.yaml                            the 18 + 18 mix5 sources of eupe_mix5.yaml, latent_normalizer
+  scaling-ladder/_mix5_recipe.yaml           training, wandb, fvd of the ladder (also included by _mix5_common.yaml)
+  scaling-ladder/<size>/wan22_ti2v_mix5_<size>_xpred_interval3_cond1gen16_res128_bs32_lr2e-4_wd0_ep1.yaml
+```
+
+Every section except `stage1`, `dit`, `transport.time_dist_shift`, `latent_normalizer` and the
+W&B tags equals the size's `vrae_eupe_mix5_<size>_..._res128_bs32_...` config (a test checks it).
+The weights are a symlink:
+
+```bash
+mkdir -p $CKPTS/pretrained/wan22_vae   # $CKPTS: checkpoint_write_root (or ckpts/)
+ln -s /path/to/Wan2.2-TI2V-5B/Wan2.2_VAE.pth $CKPTS/pretrained/wan22_vae/Wan2.2_VAE.pth
+```
+
+### Commands
+
+```bash
+CONFIG=configs/training/nanovvm_video_pred/scaling-ladder/tiny/wan22_ti2v_mix5_tiny_xpred_interval3_cond1gen16_res128_bs32_lr2e-4_wd0_ep1.yaml
+python -m vrae.training.nanovvm_video_pred.train --config $CONFIG --build-only
+python -m vrae.training.nanovvm_video_pred.check --config $CONFIG --paths configs/paths.local.yaml
+# Once for all six sizes: the future-latent statistics (and z0's, recorded).
+torchrun --standalone --nproc_per_node=2 -m vrae.training.nanovvm_video_pred.latent_stats \
+  --config $CONFIG --paths configs/paths.local.yaml
+# The Wan2.2 VAE's reconstruction ceiling: ae_reconstruction and static vs real, no DiT.
+torchrun --standalone --nproc_per_node=2 -m vrae.training.nanovvm_video_pred.fvd \
+  --config $CONFIG --paths configs/paths.local.yaml --controls-only --splits val --output <directory>
+torchrun --standalone --nproc_per_node=2 -m vrae.training.nanovvm_video_pred.train \
+  --config $CONFIG --paths configs/paths.local.yaml
+```
+
+The FVD controls receive frame 0 as well: `reconstruct_future(future, condition_rgb)` encodes and
+decodes the 17-frame clip with the Wan2.2 VAE (static: 17 copies of frame 0); the V-RAE predictor
+ignores it. The predictor identity names the backend and the weights' hash, so Wan and V-RAE
+control caches never mix.
+
 ## Tests
 
 ```bash
 CUDA_VISIBLE_DEVICES= PYTHONPATH=src python -m unittest \
-  tests.test_nanovvm_video_pred tests.test_nanovvm_scaling_ladder tests.test_remote_video_storage -v
+  tests.test_nanovvm_video_pred tests.test_nanovvm_scaling_ladder tests.test_remote_video_storage \
+  tests.test_nanovvm_fvd tests.test_nanovvm_wan22 -v
 ```
 
 The tests run on CPU with synthetic videos and small weights. Hide the GPUs on a GPU node, as above,
@@ -768,7 +870,15 @@ because the end-to-end test keeps its tiny model on the CPU. They cover:
 - for FVD (`test_nanovvm_fvd.py`): the ladder's `fvd` section against NanoVVM's protocol (the
   train_eval manifests mirror the val ones), rejected settings, resume identity, path resolution,
   and the engine end to end with a toy encoder: NanoVVM's pooled and per-dataset keys, the 17-frame
-  mp4s, cached controls and features on a later step, the same noise per clip, and the caller's RNG.
+  mp4s, cached controls and features on a later step, the same noise per clip, and the caller's RNG;
+- for the Wan2.2 path (`test_nanovvm_wan22.py`; a narrow random `WanVAE_` at 32x32, no weights): the
+  loader's VAE config and official normalization, the causal `z0` (equal to frame 0 alone, unchanged
+  by the future), rejection of clips other than 17 frames, causal decoding with `z0`, fp32 under an
+  outer autocast; the DiT against a literal port of Wan2.2's forward, `z0` at t = 0, the null `z0`,
+  aliases, the base head, exact gradient checkpointing, and the transport; the ladder's parameter
+  counts and the 5B formula; the six configs (`--build-only`, shift sqrt(3), equality with the
+  EUPE res128 twins, rejected settings); statistics, train, resume and sampling end to end; and the
+  controls-only FVD with frame 0 passed to the controls.
 
 The repository's `.gitignore` excludes `/tests/`, so these files were added with `git add -f`.
 
@@ -790,6 +900,8 @@ The repository's `.gitignore` excludes `/tests/`, so these files were added with
 | `src/vrae/models/dit/first_frame_prediction_dit.py` | the DiT (a subclass of `VRAEVideoDiT`) |
 | `src/vrae/models/dit/conditioning.py` | `FirstFrameConditionAdapter` |
 | `src/vrae/models/encoders/base.py` | `encode_images` single-image entry |
+| `src/vrae/models/video_vae/` | the Wan2.2 VAE source (`wan22.py`) and its backend (`backend.py`) |
+| `src/vrae/models/dit/wan_ti2v_dit.py` | the Wan2.2-TI2V DiT (`wan_ti2v_dit`) |
 
 `VRAEVideoDiT` now runs its encoder, decoder, and heads through a shared `_denoise`
 method, and its UCF101/Kinetics-600 outputs are unchanged. The Cityscapes 12-to-12 task
