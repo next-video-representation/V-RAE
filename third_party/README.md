@@ -9,6 +9,13 @@ inside this directory:
 - `eupe/`: https://github.com/facebookresearch/EUPE
 - `vjepa2/`: https://github.com/facebookresearch/vjepa2
 
+The Wan2.2 VAE source (Wan-Video/Wan2.2 commit `1ea34ff48f87168174e12956e200b1d908b1c5ff`,
+`wan/modules/vae2_2.py`) is vendored as `src/vrae/models/video_vae/wan22.py` under Apache-2.0
+(`licenses/Wan2.2-LICENSE`); the only change is loading the checkpoint with
+`weights_only=True, mmap=True`. `src/vrae/models/dit/wan_ti2v_dit.py` ports the architecture of
+`wan/modules/model.py` at the same commit. The weights (`Wan2.2_VAE.pth` of
+[Wan-AI/Wan2.2-TI2V-5B](https://huggingface.co/Wan-AI/Wan2.2-TI2V-5B)) are not included.
+
 SigLIP2 is loaded through the pinned Transformers interface and therefore does
 not require a source checkout. Model weights live under
 `ckpts/pretrained/encoders/`. No encoder adapter reads source or model files from
