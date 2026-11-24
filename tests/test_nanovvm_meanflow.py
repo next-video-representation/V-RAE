@@ -11,6 +11,7 @@ from __future__ import annotations
 import math
 import sys
 import unittest
+import unittest.mock
 from pathlib import Path
 
 import torch
@@ -21,8 +22,11 @@ sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT))
 
 from vrae.config import load_config  # noqa: E402
+from vrae.models.dit.meanflow import MeanFlowTransport, adaptive_loss  # noqa: E402
+from vrae.models.dit.transport import FlowMatchingTransport  # noqa: E402
 from vrae.models.dit.wan_ti2v_dit import WanTI2VDiT  # noqa: E402
 from vrae.training.common.engine import flow_transport_metadata  # noqa: E402
+from torch import nn  # noqa: E402
 from tests.test_nanovvm_video_pred import assert_close, randomize  # noqa: E402
 from tests.test_nanovvm_wan22 import small_wan_dit, wan_ladder_path  # noqa: E402
 
@@ -351,6 +355,300 @@ class JVPTest(unittest.TestCase):
         self.assertGreater(dudt[0].abs().sum().item(), 0)
         # With grad enabled the same model checkpoints its blocks (the training forward is unchanged).
         self.assertTrue(isinstance(model, WanTI2VDiT) and model.gradient_checkpointing and model.training)
+
+
+# ---------------------------------------------------------------- step 2: MeanFlowTransport
+
+
+def meanflow_dit(**overrides) -> WanTI2VDiT:
+    torch.manual_seed(0)
+    arguments = dict(time_delta_conditioning=True, frame_dropout=0.3)
+    arguments.update(overrides)
+    dit = small_wan_dit(**arguments)
+    randomize(dit, std=0.02)  # the zero heads / zero condition layers would block every gradient
+    return dit
+
+
+def meanflow(**overrides) -> MeanFlowTransport:
+    arguments = dict(variant="imf", time_dist_shift=math.sqrt(3), ratio_r_neq_t=0.5)
+    arguments.update(overrides)
+    return MeanFlowTransport(**arguments)
+
+
+def toy_batch(batch: int = 4, seed: int = 0):
+    generator = torch.Generator().manual_seed(seed)
+    return torch.randn(batch, 4, 16, 48, generator=generator), torch.randn(batch, 16, 48, generator=generator)
+
+
+class Spy(nn.Module):
+    """Records every call: batch size, grad mode and the condition-drop mask."""
+
+    def __init__(self, inner: nn.Module) -> None:
+        super().__init__()
+        self.inner = inner
+        self.calls: list[dict] = []
+
+    @property
+    def frame_dropout(self) -> float:
+        return self.inner.frame_dropout
+
+    def forward(self, noisy, time, context=None, **kwargs):
+        mask = kwargs.get("condition_drop_mask")
+        self.calls.append({
+            "batch": noisy.shape[0],
+            "grad": torch.is_grad_enabled(),
+            "mask": None if mask is None else mask.clone(),
+            "omega": kwargs.get("guidance_scale"),
+            "keys": sorted(kwargs),
+        })
+        return self.inner(noisy, time, context, **kwargs)
+
+
+def no_internal_dropout():
+    """Patch the DiT's mask resolution so a missing explicit mask fails the test."""
+
+    import vrae.models.dit.wan_ti2v_dit as wan_module
+
+    original = wan_module._resolve_drop_mask
+
+    def strict(**kwargs):
+        if kwargs["drop_mask"] is None:
+            raise AssertionError("the DiT drew its own condition-dropout mask")
+        return original(**kwargs)
+
+    return unittest.mock.patch.object(wan_module, "_resolve_drop_mask", strict)
+
+
+class TimeSamplingTest(unittest.TestCase):
+    """Test 8."""
+
+    def test_max_min(self):
+        transport = meanflow(ratio_r_neq_t=0.25)
+        for batch in (4, 7, 32):
+            t, r, neq = transport.sample_t_r(batch, device="cpu", generator=torch.Generator().manual_seed(batch))
+            self.assertTrue(bool((t >= r).all()))
+            self.assertEqual(int(neq.sum()), math.floor(0.25 * batch + 0.5))
+            self.assertTrue(torch.equal(t[~neq], r[~neq]))
+            self.assertTrue(bool((r[neq] < t[neq]).all()))
+            self.assertTrue(bool(((t >= 0) & (t <= 1) & (r >= 0) & (r <= 1)).all()))
+        # Positions are random: different draws select different rows.
+        selections = {tuple(meanflow(ratio_r_neq_t=0.5).sample_t_r(16, device="cpu", generator=torch.Generator()
+                                                                 .manual_seed(seed))[2].tolist())
+                      for seed in range(8)}
+        self.assertGreater(len(selections), 1)
+        for ratio, count in ((0.0, 0), (1.0, 9)):
+            _, _, neq = meanflow(ratio_r_neq_t=ratio).sample_t_r(9, device="cpu")
+            self.assertEqual(int(neq.sum()), count)
+        # t, r are the max / min of two draws of FlowMatchingTransport's distribution, shift included.
+        reference = FlowMatchingTransport(prediction="velocity", time_dist_shift=math.sqrt(3))
+        generator = torch.Generator().manual_seed(5)
+        first = reference.sample_time(64, device="cpu", generator=generator)
+        second = reference.sample_time(64, device="cpu", generator=generator)
+        t, r, neq = meanflow(ratio_r_neq_t=1.0).sample_t_r(64, device="cpu", generator=torch.Generator().manual_seed(5))
+        self.assertTrue(torch.equal(t, torch.maximum(first, second)))
+        self.assertTrue(torch.equal(r, torch.minimum(first, second)))
+        unshifted, _, _ = meanflow(ratio_r_neq_t=1.0, time_dist_shift=1.0).sample_t_r(
+            64, device="cpu", generator=torch.Generator().manual_seed(5))
+        assert_close(t, reference.shift_time(unshifted), atol=1e-6)
+        self.assertGreater(t.mean().item(), unshifted.mean().item())
+
+    def test_v1_keeps_the_flow_matching_marginal(self):
+        transport = meanflow(tr_sampler="v1", ratio_r_neq_t=0.5)
+        reference = FlowMatchingTransport(prediction="velocity", time_dist_shift=math.sqrt(3))
+        t, r, neq = transport.sample_t_r(32, device="cpu", generator=torch.Generator().manual_seed(3))
+        self.assertTrue(torch.equal(t, reference.sample_time(32, device="cpu",
+                                                             generator=torch.Generator().manual_seed(3))))
+        self.assertEqual(int(neq.sum()), 16)
+        self.assertTrue(bool((r <= t).all()))
+        self.assertTrue(torch.equal(r[~neq], t[~neq]))
+        # A separate r distribution (r_time_dist_*) only moves r.
+        other = meanflow(tr_sampler="v1", r_time_dist_type="logit-normal_-1_1", r_time_dist_shift=1.0)
+        t2, r2, _ = other.sample_t_r(32, device="cpu", generator=torch.Generator().manual_seed(3))
+        self.assertTrue(torch.equal(t2, t))
+        self.assertEqual(other.metadata()["r_time_dist_type"], "logit-normal_-1_1")
+        self.assertEqual(transport.metadata()["r_time_dist_type"], "logit-normal_0_1")
+
+    def test_invalid_settings(self):
+        for kwargs, match in (
+            ({"variant": "pmf"}, "variant"),
+            ({"prediction": "x"}, "prediction"),
+            ({"variant": "mf", "tangent": "boundary"}, "tangent"),
+            ({"variant": "imf", "tangent": "conditional"}, "tangent"),
+            ({"ratio_r_neq_t": 1.5}, "ratio_r_neq_t"),
+            ({"adaptive_weight": {"p": -1.0}}, "adaptive_weight.p"),
+            ({"adaptive_weight": {"eps": 0.0}}, "adaptive_weight.eps"),
+            ({"adaptive_weight": {"q": 1.0}}, "unknown"),
+            ({"t_eps": 0.05}, "t_eps"),
+            ({"tr_sampler": "v0"}, "tr_sampler"),
+            ({"r_time_dist_type": "logit-normal_0_1"}, "v1 only"),
+            ({"jvp": {"dtype": "float16"}}, "jvp.dtype"),
+            ({"jvp": {"attention_backend": "flash"}}, "attention_backend"),
+            ({"jvp": {"compile": True}}, "unknown"),
+            ({"cfg": {"mode": "sometimes"}}, "cfg.mode"),
+            ({"type": "flow_matching"}, "meanflow"),
+        ):
+            with self.subTest(kwargs=kwargs), self.assertRaisesRegex(ValueError, match):
+                meanflow(**kwargs)
+        meanflow(t_eps=None)  # the null that overrides the flow-matching t_eps of an included file
+
+
+class MeanFlowLossTest(unittest.TestCase):
+    """Test 5."""
+
+    def test_reduces_to_velocity_flow_matching(self):
+        dit = meanflow_dit()
+        dit.eval()
+        clean, z0 = toy_batch()
+        noise = torch.randn(clean.shape, generator=torch.Generator().manual_seed(9))
+        time = torch.tensor([0.2, 0.5, 0.7, 0.95])  # >= t_eps: FM's target is not clamped
+        flow = FlowMatchingTransport(prediction="velocity", time_dist_shift=math.sqrt(3), base_model_coeff=1.0)
+        expected = flow.training_losses(dit, clean, z0, time=time, noise=noise)
+        for variant in ("mf", "imf"):
+            transport = meanflow(variant=variant, ratio_r_neq_t=0.0, adaptive_weight={"p": 0.0, "eps": 0.01})
+            losses = transport.training_losses(dit, clean, z0, jvp_model=dit, time=time, noise=noise,
+                                               drop_mask=torch.zeros(4, dtype=torch.bool))
+            dimension = clean[0].numel()
+            with self.subTest(variant=variant):
+                self.assertTrue(math.isclose(losses["loss_full"].item(), dimension * expected["loss_full"].item(),
+                                             rel_tol=1e-5))
+                self.assertTrue(math.isclose(losses["loss_base"].item(), dimension * expected["loss_base"].item(),
+                                             rel_tol=1e-5))
+                self.assertTrue(math.isclose(losses["mse_full"].item(), expected["loss_full"].item(), rel_tol=1e-5))
+                self.assertTrue(math.isclose(losses["mse_fm"].item(), expected["loss_full"].item(), rel_tol=1e-5))
+                self.assertEqual(losses["mse_mf"].item(), 0.0)
+                self.assertEqual(losses["dudt"].abs().sum().item(), 0.0)
+        # With p = 1 every sample's term is L_i / (L_i + eps) (adaptive weighting, sum over elements).
+        per_sample = torch.tensor([3.0, 0.5, 100.0])
+        self.assertTrue(torch.allclose(adaptive_loss(per_sample, 1.0, 0.01), (per_sample / (per_sample + 0.01)).mean()))
+        self.assertTrue(torch.allclose(adaptive_loss(per_sample, 0.5, 0.01),
+                                       (per_sample / (per_sample + 0.01).sqrt()).mean()))
+
+    def test_tangents_and_jvp(self):
+        dit = meanflow_dit()
+        dit.train()
+        clean, z0 = toy_batch(6)
+        noise = torch.randn(clean.shape, generator=torch.Generator().manual_seed(4))
+        time = torch.tensor([0.9, 0.6, 0.8, 0.3, 0.7, 0.5])
+        time_r = torch.tensor([0.2, 0.6, 0.1, 0.3, 0.65, 0.0])
+        drop = torch.tensor([False, True, False, False, True, False])
+        neq = time_r < time
+        common = dict(jvp_model=dit, time=time, time_r=time_r, noise=noise, drop_mask=drop)
+        mf = meanflow(variant="mf").training_losses(dit, clean, z0, **common)
+        self.assertTrue(torch.equal(mf["tangent"], noise - clean))  # MF: tangent = target = e - x
+        self.assertTrue(torch.equal(mf["target"], noise - clean))
+        imf = meanflow(variant="imf").training_losses(dit, clean, z0, **common)
+        noisy = imf["noisy"]
+        with torch.no_grad():
+            boundary = dit(noisy, time, z0, time_delta=torch.zeros(6), condition_drop_mask=drop)
+        assert_close(imf["tangent"][neq], boundary[neq], atol=1e-5)  # iMF: u(z, t, 0), drop-applied
+        self.assertTrue(torch.equal(imf["target"], noise - clean))
+        # dudt = the JVP of u(z, t, t - r) along (tangent, 1, 0) on the r != t rows, 0 elsewhere.
+        for losses in (mf, imf):
+            _, (expected_full, expected_base) = jvp_math(
+                lambda z_, t_, r_: dit(z_[neq], t_[neq], z0[neq], time_delta=(t_ - r_)[neq],
+                                       condition_drop_mask=drop[neq], return_base=True),
+                (noisy, time, time_r), (losses["tangent"], torch.ones(6), torch.zeros(6)),
+            )
+            assert_close(losses["dudt"][neq], expected_full, atol=1e-4)
+            assert_close(losses["dudt_base"][neq], expected_base, atol=1e-4)
+            self.assertEqual(losses["dudt"][~neq].abs().sum().item(), 0.0)
+            self.assertEqual(losses["dudt_base"][~neq].abs().sum().item(), 0.0)
+            self.assertGreater(losses["dudt"][neq].abs().min().item(), 0.0)
+        # Sub-batch JVP == full-batch JVP masked to the r != t rows.
+        for variant in ("mf", "imf"):
+            subset = meanflow(variant=variant).training_losses(dit, clean, z0, **common)
+            full = meanflow(variant=variant, jvp={"neq_subset_only": False}).training_losses(dit, clean, z0, **common)
+            with self.subTest(variant=variant):
+                assert_close(subset["dudt"], full["dudt"], atol=1e-5)
+                assert_close(subset["dudt_base"], full["dudt_base"], atol=1e-5)
+                self.assertEqual(full["dudt"][~neq].abs().sum().item(), 0.0)
+                assert_close(subset["loss"], full["loss"], atol=1e-5)
+        # The jvp precision option: autocast (no fp32 override) still gives the same derivative in fp32.
+        autocast = meanflow(variant="mf", jvp={"dtype": "autocast"}).training_losses(dit, clean, z0, **common)
+        assert_close(autocast["dudt"], mf["dudt"], atol=1e-5)
+        # The logged statistics.
+        self.assertTrue(math.isclose(mf["dudt_rms"].item(), mf["dudt"][neq].square().mean().sqrt().item(),
+                                     rel_tol=1e-5))
+        error = ((dit(noisy, time, z0, time_delta=time - time_r, condition_drop_mask=drop).detach()
+                  + (time - time_r)[:, None, None, None] * mf["dudt"]) - mf["target"]).square()
+        self.assertTrue(math.isclose(mf["mse_mf"].item(), error[neq].mean().item(), rel_tol=1e-4))
+        self.assertTrue(math.isclose(mf["mse_fm"].item(), error[~neq].mean().item(), rel_tol=1e-4))
+        self.assertTrue(math.isclose(mf["mse_full"].item(), error.mean().item(), rel_tol=1e-4))
+
+    def test_drop_mask_is_drawn_once(self):
+        """Test 6: every forward of one call gets the same mask; the DiT never draws its own."""
+
+        for variant, ratio in (("mf", 1.0), ("imf", 1.0), ("imf", 0.5)):
+            dit = meanflow_dit(frame_dropout=0.5)
+            dit.train()
+            spy = Spy(dit)
+            clean, z0 = toy_batch(8)
+            with no_internal_dropout():
+                losses = meanflow(variant=variant, ratio_r_neq_t=ratio).training_losses(
+                    spy, clean, z0, jvp_model=spy, generator=torch.Generator().manual_seed(1))
+            drop, neq = losses["drop_mask"], losses["neq"]
+            with self.subTest(variant=variant, ratio=ratio):
+                self.assertTrue(bool(drop.any()) and not bool(drop.all()))
+                self.assertEqual(len(spy.calls), 2 if variant == "mf" else 3)
+                for call in spy.calls:
+                    expected = drop if call["batch"] == 8 else drop[neq]
+                    self.assertTrue(torch.equal(call["mask"], expected))
+                self.assertEqual([call["grad"] for call in spy.calls][-1], True)
+                self.assertEqual(sum(call["grad"] for call in spy.calls), 1)
+
+
+class MeanFlowGradientTest(unittest.TestCase):
+    """Test 7."""
+
+    def test_dudt_carries_no_gradient(self):
+        for variant in ("mf", "imf"):
+            dit = meanflow_dit(gradient_checkpointing=True)
+            dit.train()
+            clean, z0 = toy_batch(6)
+            transport = meanflow(variant=variant)
+            losses = transport.training_losses(dit, clean, z0, jvp_model=dit,
+                                               generator=torch.Generator().manual_seed(2))
+            self.assertFalse(losses["dudt"].requires_grad)
+            losses["loss"].backward()
+            grads = {name: p.grad.clone() for name, p in dit.named_parameters()}
+            dit.zero_grad(set_to_none=True)
+            # The same objective with dudt as a constant from the start.
+            t, r = losses["t"], losses["r"]
+            h = (t - r)[:, None, None, None]
+            out = dit(losses["noisy"], t, z0, time_delta=t - r, condition_drop_mask=losses["drop_mask"],
+                      return_base=True, return_dict=True)
+            target = losses["target"]
+            full = adaptive_loss(((out["full"] + h * losses["dudt"]) - target).square().flatten(1).sum(1), 1.0, 0.01)
+            base = adaptive_loss(((out["base"] + h * losses["dudt_base"]) - target).square().flatten(1).sum(1),
+                                 1.0, 0.01)
+            (full + base).backward()
+            with self.subTest(variant=variant):
+                assert_close(full + base, losses["loss"].detach(), atol=1e-5)
+                for name, parameter in dit.named_parameters():
+                    assert_close(parameter.grad, grads[name], atol=1e-6)
+
+    def test_every_parameter_gets_a_gradient_and_model_runs_once(self):
+        for name, dit_flags, transport_flags in (
+            ("mf", {}, {"variant": "mf"}),
+            ("imf", {}, {"variant": "imf"}),
+        ):
+            dit = meanflow_dit(gradient_checkpointing=True, **dit_flags)
+            dit.train()
+            wrapper = Spy(dit)  # stands in for DDP: the trainer passes model=DDP(dit), jvp_model=dit
+            clean, z0 = toy_batch(6)
+            with no_internal_dropout():
+                losses = meanflow(**transport_flags).training_losses(
+                    wrapper, clean, z0, jvp_model=dit, generator=torch.Generator().manual_seed(3))
+            losses["loss"].backward()
+            with self.subTest(name=name):
+                self.assertEqual(len(wrapper.calls), 1)
+                self.assertTrue(wrapper.calls[0]["grad"])
+                missing = [n for n, p in dit.named_parameters() if p.requires_grad and p.grad is None]
+                self.assertEqual(missing, [])
+                for key in ("loss", "loss_full", "loss_base", "loss_aux_v", "mse_full", "mse_base", "mse_fm",
+                            "mse_mf", "dudt_rms"):
+                    self.assertEqual(losses[key].ndim, 0, key)
+                    self.assertTrue(torch.isfinite(losses[key]), key)
 
 
 if __name__ == "__main__":
