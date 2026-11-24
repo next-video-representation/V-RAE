@@ -414,10 +414,10 @@ class MeanFlowTransport:
             return target, tangent
         # iMF without CFG: the instantaneous velocity under the sample's (dropped or kept) condition.
         tangent = torch.zeros_like(velocity)
-        rows = neq if self.jvp["neq_subset_only"] else torch.ones_like(neq)
-        if bool(rows.any()):
-            tangent[rows] = self.instantaneous_velocity(
-                model, noisy[rows], time[rows], context[rows], drop=drop[rows]
+        selected = neq if self.jvp["neq_subset_only"] else torch.ones_like(neq)
+        if bool(selected.any()):
+            tangent[selected] = self.instantaneous_velocity(
+                model, noisy[selected], time[selected], context[selected], drop=drop[selected]
             )
         return velocity, tangent
 
