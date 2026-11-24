@@ -12,7 +12,21 @@ github.com/Lyy-iiis/imeanflow imf.py; PyTorch JVP as in github.com/Gsunshine/py-
     loss = mean_i  L_i / sg((L_i + eps)^p),   L_i = sum over the sample's elements of (V - target)^2
 
 MF: tangent = target = v_t. iMF: target = v_t, tangent = the model's own instantaneous velocity
-V0(z, t) = u_theta(z, t, 0) (``tangent: boundary``) or an auxiliary v head (``aux_head``).
+V0(z, t) = u_theta(z, t, 0) (``tangent: boundary``) or an auxiliary v head at h = 0 (``aux_head``,
+whose head is trained on the same target with ``aux_v_coeff``).
+
+Classifier-free guidance (``cfg.mode``):
+
+* ``fixed`` (MF, MF paper Eq. 18-19): target = tangent = omega v_t + (1 - omega) u_theta(z, t, 0 | null);
+  omega is baked into the model, so sampling uses cfg_scale 1.
+* ``conditioned`` (iMF): omega ~ p(omega) ~ omega^-beta on [1, omega_max] and a guidance interval
+  [t_min, t_max] are network inputs; target v_g = v_t + (1 - 1/omega_eff)(v_c - v_u) with
+  omega_eff = omega inside the interval and 1 outside, tangent v_c (imf.py ``guidance_fn``). Sampling
+  feeds the guidance scale and interval to the network and runs a single branch.
+* ``none``: no guidance in training (sampling may still apply naive CFG to u, a heuristic).
+
+Samples whose condition is dropped (``frame_dropout``) get target v_t; with ``conditioned`` their
+tangent is v_u (``dropped_tangent: unconditional``) or v_c (``conditional``, the official choice).
 
 The JVP is computed with ``torch.func.jvp`` under ``torch.no_grad()`` on the unwrapped model
 (``jvp_model``); only dudt is kept. u comes from one ordinary forward through ``model`` (possibly
@@ -38,7 +52,7 @@ VARIANTS = ("mf", "imf")
 TR_SAMPLERS = ("max_min", "v1")
 TANGENTS = {"mf": ("conditional",), "imf": ("boundary", "aux_head")}
 DEFAULT_TANGENT = {"mf": "conditional", "imf": "boundary"}
-CFG_MODES = {"mf": ("none",), "imf": ("none",)}
+CFG_MODES = {"mf": ("none", "fixed"), "imf": ("none", "conditioned")}
 DROPPED_TANGENTS = ("unconditional", "conditional")
 JVP_DTYPES = ("float32", "autocast")
 JVP_ATTENTION_BACKENDS = ("math", "default")
@@ -270,6 +284,36 @@ class MeanFlowTransport:
             r = torch.minimum(t, r)
         return t.clamp(0, 1), r.clamp(0, 1), neq
 
+    def sample_guidance(
+        self,
+        batch_size: int,
+        neq: torch.Tensor,
+        *,
+        device: torch.device | str,
+        generator: torch.Generator | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """``(omega, t_min, t_max)`` [B] for ``cfg.mode: conditioned`` (imf.py ``sample_cfg_scale`` and
+        ``sample_cfg_interval``): p(omega) ~ omega^-beta on [1, omega_max]; t_min ~ U[0, 0.5],
+        t_max ~ U[0.5, 1], and [0, 1] for the r = t rows or with ``interval: false``."""
+
+        batch_size = int(batch_size)
+        uniform = torch.rand(batch_size, device=device, generator=generator)
+        log_max = math.log1p(self.cfg["omega_max"] - 1)  # log(omega_max)
+        beta = self.cfg["beta"]
+        if beta == 1:
+            omega = torch.exp(uniform * log_max)
+        else:
+            omega = torch.exp(torch.log1p(uniform * math.expm1((1 - beta) * log_max)) / (1 - beta))
+        neq = neq.to(device=device, dtype=torch.bool)
+        if self.cfg["interval"]:
+            start = 0.5 * torch.rand(batch_size, device=device, generator=generator)
+            end = 0.5 + 0.5 * torch.rand(batch_size, device=device, generator=generator)
+            start = torch.where(neq, start, torch.zeros_like(start))
+            end = torch.where(neq, end, torch.ones_like(end))
+        else:
+            start, end = torch.zeros_like(omega), torch.ones_like(omega)
+        return omega, start, end
+
     # ------------------------------------------------------------------ training
 
     @staticmethod
@@ -327,8 +371,44 @@ class MeanFlowTransport:
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """(target, tangent), both without gradients. Rows outside ``neq`` of an iMF tangent may be 0."""
 
+        def rows(value: torch.Tensor) -> torch.Tensor:  # [B] -> [B,1,...] for broadcasting
+            return expand_time(value, velocity)
+
         if self.variant == "mf":
-            return velocity, velocity
+            if self.cfg_mode != "fixed":
+                return velocity, velocity
+            unconditional = self._forward(
+                model, noisy, time, context, time_delta=torch.zeros_like(time),
+                drop=torch.ones_like(drop), guidance=None,
+            ).float()
+            omega = self.cfg["omega"]
+            guided = omega * velocity + (1 - omega) * unconditional
+            guided = torch.where(rows(drop), velocity, guided)
+            return guided, guided
+        if self.cfg_mode == "conditioned":
+            assert guidance is not None
+            omega, start, end = guidance
+            batch = velocity.shape[0]
+            inside = (time >= start) & (time <= end)
+            # v_c with omega_eff = 1 is recomputed only where omega_eff != omega.
+            redo = ~inside & (omega != 1)
+            keep, null = torch.zeros_like(drop), torch.ones_like(drop)
+            velocities = self.instantaneous_velocity(
+                model,
+                torch.cat((noisy, noisy, noisy[redo])),
+                torch.cat((time, time, time[redo])),
+                torch.cat((context, context, context[redo])),
+                drop=torch.cat((keep, null, keep[redo])),
+                omega=torch.cat((omega, torch.ones_like(omega), torch.ones_like(omega[redo]))),
+            )
+            conditional, unconditional = velocities[:batch].clone(), velocities[batch : 2 * batch]
+            conditional[redo] = velocities[2 * batch :]
+            effective = torch.where(inside, omega, torch.ones_like(omega))
+            guided = velocity + rows(1 - 1 / effective) * (conditional - unconditional)
+            target = torch.where(rows(drop), velocity, guided)
+            dropped = unconditional if self.cfg["dropped_tangent"] == "unconditional" else conditional
+            tangent = torch.where(rows(drop), dropped, conditional)
+            return target, tangent
         # iMF without CFG: the instantaneous velocity under the sample's (dropped or kept) condition.
         tangent = torch.zeros_like(velocity)
         rows = neq if self.jvp["neq_subset_only"] else torch.ones_like(neq)
@@ -433,11 +513,17 @@ class MeanFlowTransport:
             if bool((time_r > time).any()):
                 raise ValueError("r must not exceed t")
             neq = (time_r < time) if neq is None else neq.to(device=device, dtype=torch.bool)
+        if guidance is not None and self.cfg_mode != "conditioned":
+            raise ValueError("guidance inputs exist only with cfg.mode: conditioned")
         if drop_mask is None:
             drop_mask = sample_condition_dropout(
                 batch, float(jvp_model.frame_dropout), device=device, generator=generator
             )
         drop_mask = drop_mask.to(device=device, dtype=torch.bool)
+        if self.cfg_mode == "conditioned":
+            if guidance is None:
+                guidance = self.sample_guidance(batch, neq, device=device, generator=generator)
+            guidance = tuple(value.to(device=device, dtype=torch.float32) for value in guidance)
 
         expanded = expand_time(time.to(clean.dtype), clean)
         noisy = (1 - expanded) * clean + expanded * noise

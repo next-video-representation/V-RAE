@@ -651,5 +651,234 @@ class MeanFlowGradientTest(unittest.TestCase):
                     self.assertTrue(torch.isfinite(losses[key]), key)
 
 
+# ---------------------------------------------------------------- step 3: CFG and the aux v head
+
+
+def mock_u(z, t, h, drop, omega, start, end, context, scale):
+    """A smooth closed-form stand-in for u_theta (every input changes the output)."""
+
+    def col(value):
+        return value.reshape(-1, 1, 1, 1)
+
+    condition = torch.where(drop[:, None, None], -0.5 * context, context)[:, None]
+    return (scale * z * (1 + col(t)) + col(h) * col(t) ** 2 + 0.1 * col(omega) + 0.01 * col(start)
+            + 0.001 * col(end) + condition)
+
+
+class MockDiT(nn.Module):
+    """The wan_ti2v_dit call interface over mock_u; base = 0.9 full, aux v = 0.5 full + 0.3."""
+
+    def __init__(self, frame_dropout: float = 0.5) -> None:
+        super().__init__()
+        self.frame_dropout = frame_dropout
+        self.scale = nn.Parameter(torch.tensor(1.5))
+
+    def forward(self, noisy, time, context=None, *, time_delta=None, condition_drop_mask=None,
+                guidance_scale=None, guidance_interval=None, return_base=False, return_aux_v=False,
+                return_dict=False):
+        batch = noisy.shape[0]
+
+        def per_sample(value, default):
+            return torch.as_tensor(default if value is None else value, dtype=noisy.dtype).expand(batch)
+
+        start, end = (0.0, 1.0) if guidance_interval is None else guidance_interval
+        full = mock_u(noisy, per_sample(time, 0.0), per_sample(time_delta, 0.0), condition_drop_mask,
+                      per_sample(guidance_scale, 1.0), per_sample(start, 0.0), per_sample(end, 1.0), context,
+                      self.scale)
+        if not return_dict:
+            return (full, 0.9 * full) if return_base else full
+        result = {"full": full}
+        if return_base:
+            result["base"] = 0.9 * full
+        if return_aux_v:
+            result["aux_v"] = 0.5 * full + 0.3
+        return result
+
+
+class GuidanceSamplingTest(unittest.TestCase):
+    def test_omega_distribution(self):
+        count = 40_000
+        neq = torch.ones(count, dtype=torch.bool)
+        for beta in (1.0, 2.0):
+            transport = meanflow(cfg={"mode": "conditioned", "beta": beta, "omega_max": 8.0})
+            omega, _, _ = transport.sample_guidance(count, neq, device="cpu", generator=torch.Generator().manual_seed(0))
+            self.assertTrue(bool(((omega >= 1) & (omega <= 8)).all()))
+            for point in (1.5, 2.0, 4.0, 6.0):
+                expected = (math.log(point) / math.log(8) if beta == 1
+                            else (1 - point ** (1 - beta)) / (1 - 8 ** (1 - beta)))
+                empirical = (omega <= point).double().mean().item()
+                with self.subTest(beta=beta, point=point):
+                    self.assertLess(abs(empirical - expected), 0.01)
+        # The closed form against imf.py's sample_cfg_scale for one uniform draw.
+        u = torch.tensor([0.0, 0.3, 0.999])
+        transport = meanflow(cfg={"mode": "conditioned", "beta": 2.0, "omega_max": 8.0})
+        with unittest.mock.patch.object(torch, "rand", lambda *a, **k: u):
+            omega, _, _ = transport.sample_guidance(3, torch.ones(3, dtype=torch.bool), device="cpu")
+        log_base = (1 - 2.0) * math.log1p(7.0)
+        expected = torch.exp(torch.log1p(u * math.expm1(log_base)) / (1 - 2.0))
+        assert_close(omega, expected, atol=1e-6)
+
+    def test_interval(self):
+        neq = torch.tensor([True, False] * 500)
+        transport = meanflow(cfg={"mode": "conditioned"})
+        _, start, end = transport.sample_guidance(1000, neq, device="cpu", generator=torch.Generator().manual_seed(1))
+        self.assertTrue(torch.equal(start[~neq], torch.zeros(500)) and torch.equal(end[~neq], torch.ones(500)))
+        self.assertTrue(bool(((start[neq] >= 0) & (start[neq] <= 0.5)).all()))
+        self.assertTrue(bool(((end[neq] >= 0.5) & (end[neq] <= 1)).all()))
+        self.assertGreater(start[neq].std().item(), 0.1)
+        _, start, end = meanflow(cfg={"mode": "conditioned", "interval": False}).sample_guidance(
+            10, torch.ones(10, dtype=torch.bool), device="cpu")
+        self.assertTrue(torch.equal(start, torch.zeros(10)) and torch.equal(end, torch.ones(10)))
+
+    def test_mode_validation(self):
+        with self.assertRaisesRegex(ValueError, "cfg.mode"):
+            meanflow(variant="mf", cfg={"mode": "conditioned"})
+        with self.assertRaisesRegex(ValueError, "cfg.mode"):
+            meanflow(variant="imf", cfg={"mode": "fixed"})
+        with self.assertRaisesRegex(ValueError, "omega"):
+            meanflow(variant="mf", cfg={"mode": "fixed", "omega": 0.5})
+        with self.assertRaisesRegex(ValueError, "dropped_tangent"):
+            meanflow(cfg={"mode": "conditioned", "dropped_tangent": "zero"})
+        with self.assertRaisesRegex(ValueError, "cfg.mode: conditioned"):
+            meanflow().training_losses(MockDiT(), *toy_batch(2), jvp_model=MockDiT(),
+                                       guidance=(torch.ones(2), torch.zeros(2), torch.ones(2)))
+
+
+class GuidedTargetTest(unittest.TestCase):
+    def setUp(self):
+        self.clean, self.z0 = toy_batch(6)
+        self.noise = torch.randn(self.clean.shape, generator=torch.Generator().manual_seed(7))
+        self.time = torch.tensor([0.9, 0.6, 0.8, 0.3, 0.7, 0.45])
+        self.time_r = torch.tensor([0.2, 0.6, 0.1, 0.3, 0.65, 0.0])
+        self.drop = torch.tensor([False, True, False, False, True, False])
+        # omega; interval; row 2 is outside [t_min, t_max] (0.8 > 0.75), row 5 below (0.45 < 0.5).
+        self.omega = torch.tensor([3.0, 2.0, 5.0, 1.0, 4.0, 2.5])
+        self.start = torch.tensor([0.1, 0.0, 0.2, 0.0, 0.3, 0.5])
+        self.end = torch.tensor([0.95, 1.0, 0.75, 1.0, 0.9, 0.8])
+
+    def expected(self, model, transport):
+        scale = model.scale.detach()
+        z = (1 - self.time[:, None, None, None]) * self.clean + self.time[:, None, None, None] * self.noise
+        v_t = self.noise - self.clean
+        zeros, ones = torch.zeros(6), torch.ones(6)
+        keep, null = torch.zeros(6, dtype=torch.bool), torch.ones(6, dtype=torch.bool)
+
+        def velocity(drop, omega):  # V0: h = 0, interval [0, 1]; the aux head is 0.5 u + 0.3
+            u = mock_u(z, self.time, zeros, drop, omega, zeros, ones, self.z0, scale)
+            return 0.5 * u + 0.3 if transport.tangent == "aux_head" else u
+
+        inside = (self.time >= self.start) & (self.time <= self.end)
+        effective = torch.where(inside, self.omega, ones)
+        v_c = velocity(keep, effective)
+        v_u = velocity(null, ones)
+        v_g = v_t + (1 - 1 / effective)[:, None, None, None] * (v_c - v_u)
+        drop = self.drop[:, None, None, None]
+        target = torch.where(drop, v_t, v_g)
+        dropped = v_u if transport.cfg["dropped_tangent"] == "unconditional" else v_c
+        tangent = torch.where(drop, dropped, v_c)
+        return target, tangent, inside
+
+    def run_transport(self, transport, model):
+        return transport.training_losses(
+            model, self.clean, self.z0, jvp_model=model, time=self.time, time_r=self.time_r, noise=self.noise,
+            drop_mask=self.drop, guidance=(self.omega, self.start, self.end))
+
+    def test_conditioned_target_and_tangent(self):
+        for tangent in ("boundary", "aux_head"):
+            for dropped in ("unconditional", "conditional"):
+                model = MockDiT()
+                transport = meanflow(tangent=tangent, cfg={"mode": "conditioned", "dropped_tangent": dropped})
+                losses = self.run_transport(transport, model)
+                target, expected_tangent, inside = self.expected(model, transport)
+                with self.subTest(tangent=tangent, dropped=dropped):
+                    self.assertFalse(bool(inside[2]) or bool(inside[5]))
+                    assert_close(losses["target"], target, atol=1e-5)
+                    assert_close(losses["tangent"], expected_tangent, atol=1e-5)
+                    v_t = self.noise - self.clean
+                    self.assertTrue(torch.equal(losses["target"][self.drop], v_t[self.drop]))
+                    # Outside the interval omega_eff = 1: the target is v_t (no guidance).
+                    assert_close(losses["target"][2], v_t[2], atol=1e-6)
+                    # dudt is the JVP of u(z, t, t - r | dropped z0, sampled omega and interval).
+                    neq = self.time_r < self.time
+                    scale = model.scale.detach()
+                    _, expected_dudt = jvp_math(
+                        lambda z_, t_, r_: mock_u(z_, t_, t_ - r_, self.drop, self.omega, self.start, self.end,
+                                                  self.z0, scale),
+                        (losses["noisy"], self.time, self.time_r), (expected_tangent, torch.ones(6), torch.zeros(6)),
+                    )
+                    assert_close(losses["dudt"][neq], expected_dudt[neq], atol=1e-4)
+                    self.assertEqual(losses["dudt"][~neq].abs().sum().item(), 0.0)
+
+    def test_conditioned_forwards(self):
+        model = MockDiT()
+        spy = Spy(model)
+        transport = meanflow(tangent="aux_head", cfg={"mode": "conditioned"})
+        losses = transport.training_losses(
+            spy, self.clean, self.z0, jvp_model=spy, time=self.time, time_r=self.time_r, noise=self.noise,
+            drop_mask=self.drop, guidance=(self.omega, self.start, self.end))
+        # One target forward (cond + uncond + the omega_eff = 1 recomputations), the JVP, the grad forward.
+        self.assertEqual([call["batch"] for call in spy.calls], [6 + 6 + 2, 4, 6])
+        target_call, jvp_call, grad_call = spy.calls
+        self.assertTrue(torch.equal(target_call["mask"], torch.tensor([False] * 6 + [True] * 6 + [False] * 2)))
+        neq = self.time_r < self.time
+        self.assertTrue(torch.equal(jvp_call["mask"], self.drop[neq]))
+        self.assertTrue(torch.equal(grad_call["mask"], self.drop))
+        self.assertTrue(torch.equal(grad_call["omega"], self.omega))  # the sampled omega, not omega_eff
+        self.assertTrue(grad_call["grad"] and not jvp_call["grad"] and not target_call["grad"])
+        self.assertIn("return_aux_v", grad_call["keys"])
+        # The aux v loss: the grad forward's v output (h = t - r, sampled guidance) against the target.
+        t, r = self.time, self.time_r
+        u = mock_u(losses["noisy"], t, t - r, self.drop, self.omega, self.start, self.end, self.z0,
+                   model.scale.detach())
+        aux = adaptive_loss((0.5 * u + 0.3 - losses["target"]).square().flatten(1).sum(1), 1.0, 0.01)
+        assert_close(losses["loss_aux_v"], aux, atol=1e-5)
+        assert_close(losses["loss"], losses["loss_full"] + losses["loss_base"] + losses["loss_aux_v"], atol=1e-5)
+
+    def test_mf_fixed_guidance(self):
+        model = MockDiT()
+        transport = meanflow(variant="mf", cfg={"mode": "fixed", "omega": 2.5})
+        spy = Spy(model)
+        losses = transport.training_losses(spy, self.clean, self.z0, jvp_model=spy, time=self.time,
+                                           time_r=self.time_r, noise=self.noise, drop_mask=self.drop)
+        z = losses["noisy"]
+        v_t = self.noise - self.clean
+        unconditional = mock_u(z, self.time, torch.zeros(6), torch.ones(6, dtype=torch.bool), torch.ones(6),
+                               torch.zeros(6), torch.ones(6), self.z0, model.scale.detach())
+        guided = 2.5 * v_t + (1 - 2.5) * unconditional
+        guided[self.drop] = v_t[self.drop]
+        assert_close(losses["target"], guided, atol=1e-5)
+        assert_close(losses["tangent"], guided, atol=1e-5)
+        self.assertTrue(torch.equal(spy.calls[0]["mask"], torch.ones(6, dtype=torch.bool)))
+        self.assertTrue(torch.equal(spy.calls[-1]["mask"], self.drop))
+
+
+class GuidedGradientTest(unittest.TestCase):
+    def test_every_parameter_gets_a_gradient(self):
+        for name, dit_flags, transport_flags in (
+            ("imf+aux", {"aux_v_head_depth": 1}, {"tangent": "aux_head"}),
+            ("imf+cfg", {"guidance_conditioning": True}, {"cfg": {"mode": "conditioned"}}),
+            ("imf+cfg+aux", {"guidance_conditioning": True, "aux_v_head_depth": 2},
+             {"tangent": "aux_head", "cfg": {"mode": "conditioned"}}),
+            ("mf+fixed", {}, {"variant": "mf", "cfg": {"mode": "fixed"}}),
+        ):
+            dit = meanflow_dit(gradient_checkpointing=True, **dit_flags)
+            dit.train()
+            wrapper = Spy(dit)
+            clean, z0 = toy_batch(6)
+            with no_internal_dropout():
+                losses = meanflow(**transport_flags).training_losses(
+                    wrapper, clean, z0, jvp_model=dit, generator=torch.Generator().manual_seed(3))
+            losses["loss"].backward()
+            with self.subTest(name=name):
+                self.assertEqual(len(wrapper.calls), 1)
+                missing = [n for n, p in dit.named_parameters() if p.requires_grad and p.grad is None]
+                self.assertEqual(missing, [])
+                if "aux" in name:
+                    self.assertGreater(losses["loss_aux_v"].item(), 0)
+                    self.assertGreater(dit.aux_v_head.head.weight.grad.abs().sum().item(), 0)
+                if "cfg" in name:
+                    self.assertGreater(dit.guidance_scale_embedding[2].weight.grad.abs().sum().item(), 0)
+
+
 if __name__ == "__main__":
     unittest.main()
