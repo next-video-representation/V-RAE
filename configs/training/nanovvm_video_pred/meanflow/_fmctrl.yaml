@@ -1,0 +1,7 @@
+# The flow-matching control of the MeanFlow runs: MF with ratio_r_neq_t 0, i.e. u (= v) prediction flow
+# matching with MF's adaptive loss weight and u-parameterization, one network input h that is always 0.
+# Against the xpred ladder it isolates the x -> u parameterization; against _mf.yaml, MeanFlow itself.
+# Sampled with the same 1-step default as the MeanFlow runs (raise sampling.steps for an FM sampler).
+include: _mf.yaml
+transport:
+  ratio_r_neq_t: 0.0

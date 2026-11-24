@@ -1,0 +1,44 @@
+# improved MeanFlow (iMF) for nanovvm_video_pred with wan_ti2v_dit (vrae.models.dit.meanflow), no CFG.
+# A fragment: a ladder config includes it after ../../wan22_mix5.yaml and ../_mix5_recipe.yaml, so these
+# keys override the flow-matching transport / sampling of _wan22_common.yaml (includes merge mappings key
+# by key; t_eps: null removes the flow-matching t_eps, MeanFlow takes none).
+#   u-prediction: the DiT outputs the average velocity u(z_t, t, h = t - r); z_r = z_t - (t - r) u.
+#   loss: V = u + (t - r) sg(du/dt) against v_t = e - x, adaptive weight L / sg((L + eps)^p) of the
+#   per-sample sum; du/dt by torch.func.jvp along (tangent, 1, 0) on the r != t rows only.
+#   iMF tangent: the model's own instantaneous velocity u(z_t, t, 0) (boundary; aux_head: a v head).
+#   (t, r): max / min of two draws of the flow-matching shifted logit-normal (shift sqrt(3) at 128 px);
+#   round(ratio_r_neq_t * B) randomly placed rows keep r != t, the others r = t (plain u = v FM).
+#   jvp: runtime options (precision, attention backend, sub-batch), not in checkpoint metadata.
+transport:
+  type: meanflow
+  variant: imf                  # mf | imf
+  prediction: u
+  time_dist_type: logit-normal_0_1
+  time_dist_shift: 1.7320508075688772
+  t_eps: null
+  tr_sampler: max_min           # max_min | v1
+  r_time_dist_type: null        # v1 only; null = the t distribution
+  r_time_dist_shift: null
+  ratio_r_neq_t: 0.5
+  adaptive_weight: {p: 1.0, eps: 0.01}
+  tangent: boundary             # boundary | aux_head (needs dit.aux_v_head_depth > 0)
+  base_model_coeff: 1.0
+  aux_v_coeff: 1.0
+  cfg:
+    mode: none                  # none | conditioned (_imf_cfg.yaml)
+    omega: 2.0                  # cfg.mode fixed (MF) only
+    omega_max: 8.0
+    beta: 1.0                   # p(omega) ~ omega^-beta; iMF uses 1 at size B, 2 for larger models
+    interval: true
+    dropped_tangent: unconditional  # conditional = the official iMF choice
+  jvp: {dtype: float32, attention_backend: math, neq_subset_only: true}
+dit:
+  time_delta_conditioning: true
+  guidance_conditioning: false
+  aux_v_head_depth: 0
+sampling:
+  steps: 1
+  cfg_scale: 1.0
+  internal_guidance_scale: 1.0
+  guidance_interval: [0.0, 1.0]
+  time_grid: uniform            # uniform linspace(1, 0, steps + 1) | shifted (by time_dist_shift)

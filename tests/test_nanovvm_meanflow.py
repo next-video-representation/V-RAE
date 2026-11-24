@@ -1401,6 +1401,91 @@ class MeanFlowEndToEndTest(unittest.TestCase):
         return trained
 
 
+# ---------------------------------------------------------------- step 6: the configs
+
+LADDER_SIZES = ("tiny", "small", "medium", "large", "xl", "xxl")
+MEANFLOW_VARIANTS = {  # name: (sizes, to_meanflow arguments, ratio, extra tags)
+    "mf": (LADDER_SIZES, {"variant": "mf"}, 0.25, ["meanflow", "mf"]),
+    "imf": (LADDER_SIZES, {"variant": "imf"}, 0.5, ["meanflow", "imf"]),
+    "imfcfg": (("tiny", "small", "medium"), {"variant": "imf", "cfg_mode": "conditioned"}, 0.5,
+               ["meanflow", "imf", "cfg"]),
+    "fmctrl": (("tiny", "small", "medium"), {"variant": "mf"}, 0.0, ["meanflow", "fmctrl"]),
+}
+
+
+def meanflow_ladder_path(size: str, variant: str) -> Path:
+    return (wan_ladder_path(size).parent
+            / f"wan22_ti2v_mix5_{size}_{variant}_upred_interval3_cond1gen16_res128_bs32_lr2e-4_wd0_ep1.yaml")
+
+
+class LadderMeanFlowConfigTest(unittest.TestCase):
+    """Test 11 on the YAML files; tests/test_nanovvm_scaling_ladder.py::test_layout lists them."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.configs = {(size, variant): load_config(meanflow_ladder_path(size, variant))
+                       for variant, (sizes, _, _, _) in MEANFLOW_VARIANTS.items() for size in sizes}
+        cls.xpred = {size: load_config(wan_ladder_path(size)) for size in LADDER_SIZES}
+
+    def test_build_only_cli(self):
+        from unittest import mock
+
+        from vrae.training.nanovvm_video_pred import train as nv_train
+
+        for (size, variant), config in self.configs.items():
+            with self.subTest(size=size, variant=variant):
+                argv = ["train", "--config", str(meanflow_ladder_path(size, variant)), "--build-only"]
+                stdout = io.StringIO()
+                with mock.patch.object(sys, "argv", argv), contextlib.redirect_stdout(stdout):
+                    nv_train.main()
+                summary = json.loads(stdout.getvalue())
+                self.assertEqual(summary["transport"]["type"], "meanflow")
+                self.assertEqual(summary["transport"]["time_dist_shift"], math.sqrt(3))
+                self.assertEqual(summary["transport"]["ratio_r_neq_t"], MEANFLOW_VARIANTS[variant][2])
+
+    def test_equal_to_the_xpred_config_except_the_meanflow_keys(self):
+        for (size, variant), config in self.configs.items():
+            _, arguments, ratio, tags = MEANFLOW_VARIANTS[variant]
+            xpred = self.xpred[size]
+            with self.subTest(size=size, variant=variant):
+                self.assertEqual(config["run_name"], meanflow_ladder_path(size, variant).stem)
+                self.assertEqual(config["wandb"]["tags"], xpred["wandb"]["tags"] + tags)
+                transport = dict(config["transport"])
+                self.assertIsNone(transport.pop("t_eps"))  # overrides _wan22_common.yaml's flow-matching t_eps
+                expected = to_meanflow(xpred, **arguments)
+                expected["transport"]["ratio_r_neq_t"] = ratio
+                self.assertEqual(transport, expected["transport"])
+                self.assertEqual(config["sampling"], expected["sampling"])
+                self.assertEqual(config["dit"], expected["dit"])
+                strip, reference = copy.deepcopy(config), copy.deepcopy(xpred)
+                for item in (strip, reference):
+                    for key in ("transport", "sampling", "run_name"):
+                        item.pop(key)
+                    item["wandb"].pop("tags")
+                    for key in ("time_delta_conditioning", "guidance_conditioning", "aux_v_head_depth"):
+                        item["dit"].pop(key, None)
+                self.assertEqual(strip, reference)
+        cfg = self.configs[("tiny", "imfcfg")]
+        self.assertEqual((cfg["transport"]["cfg"]["mode"], cfg["dit"]["guidance_conditioning"],
+                          cfg["sampling"]["cfg_scale"]), ("conditioned", True, 2.0))
+        self.assertEqual(self.configs[("tiny", "mf")]["transport"]["tangent"], "conditional")
+        self.assertEqual(self.configs[("tiny", "imf")]["transport"]["tangent"], "boundary")
+        self.assertEqual(self.configs[("tiny", "fmctrl")]["transport"]["variant"], "mf")
+
+    def test_parameter_counts(self):
+        from tests.test_nanovvm_wan22 import WAN_LADDER, WAN_STAGE1
+        from vrae.training.nanovvm_video_pred import train as nv_train
+
+        for (size, variant), config in self.configs.items():
+            dim = WAN_LADDER[size][1]
+            embedding = 256 * dim + dim + dim * dim + dim
+            embeddings = 4 if variant == "imfcfg" else 1
+            with self.subTest(size=size, variant=variant), torch.device("meta"):
+                model = nv_train.build_nanovvm_dit(config, WAN_STAGE1)
+                self.assertEqual(sum(p.numel() for p in model.parameters()),
+                                 WAN_LADDER[size][5] + embeddings * embedding)
+
+
 def mock_patch(target, attribute, value):
     return unittest.mock.patch.object(target, attribute, value)
 

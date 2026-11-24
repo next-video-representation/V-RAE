@@ -1,0 +1,15 @@
+# improved MeanFlow with guidance as a network input (iMF's CFG, imf.py): omega ~ omega^-beta on
+# [1, omega_max] and an interval t_min ~ U[0, 0.5], t_max ~ U[0.5, 1] ([0, 1] on the r = t rows) enter
+# the DiT's time embedding (dit.guidance_conditioning); the target is
+# v_g = v_t + (1 - 1/omega_eff)(v_c - v_u), omega_eff = 1 outside the interval. Sampling feeds
+# sampling.cfg_scale as omega and sampling.guidance_interval with one forward per step.
+include: _imf.yaml
+transport:
+  cfg:
+    mode: conditioned
+dit:
+  guidance_conditioning: true
+sampling:
+  # A placeholder: sweep omega (and the interval) with the sample CLI, e.g.
+  #   python -m vrae.training.nanovvm_video_pred.sample ... --cfg-scale 3.0 --guidance-interval 0.1 0.9
+  cfg_scale: 2.0

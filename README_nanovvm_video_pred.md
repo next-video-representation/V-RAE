@@ -829,12 +829,139 @@ decodes the 17-frame clip with the Wan2.2 VAE (static: 17 copies of frame 0); th
 ignores it. The predictor identity names the backend and the weights' hash, so Wan and V-RAE
 control caches never mix.
 
+## MeanFlow and improved MeanFlow (Wan path)
+
+MeanFlow (MF; Geng et al. 2025) and improved MeanFlow (iMF; github.com/Lyy-iiis/imeanflow) train
+`wan_ti2v_dit` for one- or few-step generation on the Wan2.2 path. `transport.type: meanflow` selects
+`MeanFlowTransport` (`src/vrae/models/dit/meanflow.py`); without it the flow-matching transport and
+every existing config, model, checkpoint and sample are unchanged (a test compares them bit for bit).
+
+### Objective
+
+Same interpolation as flow matching, `z_t = (1 - t) x + t e` (t = 1 noise), with `v_t = e - x` (no
+`t_eps`). The DiT predicts the average velocity `u(z_t, t, h = t - r)` over `[r, t]` (u-prediction)
+and one step is `z_r = z_t - (t - r) u`.
+
+```text
+dudt = JVP of u(z, t, t - r) along (dz, dt, dr) = (tangent, 1, 0)     # r != t rows only, no gradient
+V    = u(z, t, t - r) + (t - r) dudt
+loss = mean_i  L_i / sg((L_i + eps)^p),   L_i = sum over the sample's 4*64*48 elements of (V - target)^2
+```
+
+- **MF**: target = tangent = `v_t`.
+- **iMF**: target = `v_t`, tangent = the model's own instantaneous velocity `V0(z, t)`:
+  `u(z, t, 0)` (`tangent: boundary`, default) or an auxiliary v head (`tangent: aux_head`, trained on the
+  same target with `aux_v_coeff`).
+- **(t, r)**: `max_min` takes the max / min of two draws of the flow-matching shifted logit-normal (shift
+  sqrt(3)); `v1` keeps t's flow-matching marginal and draws r separately, then `r = min(t, r)`. Exactly
+  `round(ratio_r_neq_t * B)` randomly placed rows of each micro-batch keep r != t, the others get r = t
+  (plain u = v flow matching).
+- **Internal guidance**: the base head gets the same loss (`base_model_coeff`); one JVP call returns
+  both heads' dudt. Sampling applies IG to u as before, from the same forward.
+- **CFG** (`cfg.mode`): `none`; `fixed` (MF only, MF Eq. 18-19: target = tangent =
+  `omega v_t + (1 - omega) u(z, t, 0 | null)`, sample with `cfg_scale: 1`); `conditioned` (iMF only):
+  omega ~ omega^-beta on `[1, omega_max]` and an interval `t_min ~ U[0, 0.5]`, `t_max ~ U[0.5, 1]`
+  (`[0, 1]` on r = t rows) are network inputs, target `v_g = v_t + (1 - 1/omega_eff)(v_c - v_u)` with
+  `omega_eff = 1` outside the interval, tangent `v_c`. Rows whose `z0` is dropped (`frame_dropout`) get
+  target `v_t` and tangent `v_u` (`dropped_tangent: unconditional`) or `v_c` (`conditional`).
+
+**Implementation.** The JVP is `torch.func.jvp` under `torch.no_grad()` on the unwrapped DiT, in fp32
+with autocast off and the math SDPA backend (flash / efficient attention have no forward-mode AD); only
+dudt is kept. u comes from the one forward per micro-step through the (DDP) model, so gradient
+synchronization, `no_sync` accumulation and gradient checkpointing are untouched (the DiT skips
+checkpointing under no_grad). The drop mask is drawn once per micro-step and passed to every forward.
+For the first `training.grad_sync_check_steps` optimizer steps (MeanFlow default 2) the trainer
+all-gathers the largest gradients' norms and stops if the ranks differ.
+
+### DiT inputs
+
+`dit.time_delta_conditioning: true` adds `time_delta_embedding` (Wan's `time_embedding` form,
+`sinusoid(1000 h)`; frame 0 at h = 0, the future at h); `dit.guidance_conditioning: true` adds
+embeddings of `1 - 1/omega`, `t_min` and `t_max` on every frame. All are summed into the time embedding
+before `time_projection`, and their last Linear is zero-initialized, so a new model computes exactly
+what the same weights compute without them. `dit.aux_v_head_depth: K` adds K blocks and a head that
+fork after block L - K (for `tangent: aux_head`; `base_depth <= L - K`); sampling never runs them.
+Extra parameters: `256 d + d^2 + 2 d` per embedding (tiny +0.25M, medium +1.97M; iMF-CFG four times).
+
+### Configuration
+
+```text
+configs/training/nanovvm_video_pred/meanflow/
+  _imf.yaml       iMF, boundary tangent, ratio 0.5, no CFG; all keys and defaults below
+  _mf.yaml        MF: variant mf, tangent conditional, ratio 0.25 (cfg.mode fixed optional)
+  _imf_cfg.yaml   iMF with cfg.mode conditioned, dit.guidance_conditioning, sampling.cfg_scale 2.0 (a placeholder)
+  _fmctrl.yaml    control: MF with ratio_r_neq_t 0 = u (= v) flow matching with MF's loss weighting
+scaling-ladder/<size>/wan22_ti2v_mix5_<size>_{mf,imf}_upred_interval3_cond1gen16_res128_bs32_lr2e-4_wd0_ep1.yaml   all six sizes
+scaling-ladder/<size>/wan22_ti2v_mix5_<size>_{imfcfg,fmctrl}_upred_..._ep1.yaml                                   tiny, small, medium
+```
+
+Each ladder file includes `../../wan22_mix5.yaml`, `../_mix5_recipe.yaml`, then its fragment, and
+equals the size's `..._xpred_...` config except `transport`, the DiT's MeanFlow keys, `sampling`,
+`run_name` and the W&B tags (a test checks it). The fragment sets `t_eps: null` to remove the
+flow-matching `t_eps` that `_wan22_common.yaml` merges in.
+
+| key | default | meaning |
+| --- | --- | --- |
+| `transport.variant` | `imf` | `mf` or `imf` |
+| `transport.prediction` | `u` | the only value |
+| `transport.tr_sampler` | `max_min` | or `v1` (with `r_time_dist_type` / `r_time_dist_shift`, null = t's) |
+| `transport.ratio_r_neq_t` | 0.5 (MF 0.25, control 0) | fraction of rows with r != t |
+| `transport.adaptive_weight` | `{p: 1.0, eps: 0.01}` | `L / sg((L + eps)^p)` |
+| `transport.tangent` | `boundary` (MF `conditional`) | iMF: `boundary` or `aux_head` |
+| `transport.base_model_coeff`, `aux_v_coeff` | 1.0, 1.0 | weights of the base-head and aux-v losses |
+| `transport.cfg` | `{mode: none, omega: 2.0, omega_max: 8.0, beta: 1.0, interval: true, dropped_tangent: unconditional}` | see Objective |
+| `transport.jvp` | `{dtype: float32, attention_backend: math, neq_subset_only: true}` | runtime only: `autocast` keeps the outer bf16; not in checkpoint metadata, so a run resumes with other values |
+| `sampling.steps` | 1 | Euler steps on the grid |
+| `sampling.guidance_interval` | `[0.0, 1.0]` | iMF-CFG network input |
+| `sampling.time_grid` | `uniform` | `linspace(1, 0, N + 1)`, or `shifted` by `time_dist_shift` |
+| `training.grad_sync_check_steps` | 2 (flow matching 0) | DDP gradient check, ignored by resume |
+
+Model metadata records the transport's algorithm fields (`type: meanflow`, variant, distributions,
+ratio, weights, tangent, cfg) and the DiT's MeanFlow keys; resuming with a different algorithm field
+is refused, with different `jvp` options it is not. W&B adds `loss/train_aux_v`, `mse/train_full`,
+`mse/train_base` (unweighted per-element MSE of V against the target, comparable to flow matching),
+`mse/train_fm` / `mse/train_mf` (the r = t / r < t rows) and `stats/dudt_rms`. The adaptive weight
+makes the gradient roughly `grad(mse) / mse`, so its scale differs from flow matching's; `clip_grad`
+stays at the recipe's 1.0 and `optimizer/grad_norm` is the pre-clip norm.
+
+### Differences from the official implementations
+
+- The network reads t and h (official iMF reads h only): Wan's per-frame t embedding is what tells the
+  clean `z0` frame (t = 0) from the noisy future frames.
+- The r != t rows are a fixed number of random positions (official iMF: the first half of the batch).
+- Dropped rows use the tangent `v_u` by default (official: `v_c`; `dropped_tangent: conditional`).
+- Time distribution: the flow-matching shifted logit-normal (logit-normal(0, 1), shift sqrt(3)), not
+  the official logit-normal(-0.4, 1).
+- iMF defaults to the boundary tangent `u(z, t, 0)`, not the official 8-block auxiliary v head
+  (`tangent: aux_head` with `dit.aux_v_head_depth`).
+- The guidance scale and interval are added to Wan's time embedding, not in-context tokens.
+- Not implemented: pixel MeanFlow (x-prediction converted to u, perceptual losses, noise scale), a Triton
+  JVP kernel, `torch.compile`, FSDP.
+
+### Commands
+
+```bash
+CONFIG=configs/training/nanovvm_video_pred/scaling-ladder/tiny/wan22_ti2v_mix5_tiny_imf_upred_interval3_cond1gen16_res128_bs32_lr2e-4_wd0_ep1.yaml
+python -m vrae.training.nanovvm_video_pred.train --config $CONFIG --build-only
+torchrun --standalone --nproc_per_node=2 -m vrae.training.nanovvm_video_pred.train \
+  --config $CONFIG --paths configs/paths.local.yaml
+# 1, 2 or more steps; iMF-CFG: sweep omega and the interval (network inputs, one forward per step).
+python -m vrae.training.nanovvm_video_pred.sample --config $CONFIG --paths configs/paths.local.yaml \
+  --checkpoint ckpts/nanovvm_video_pred/<run>/checkpoints/step-00010000.pt --split val --count 64 \
+  --output <directory> --steps 2 [--cfg-scale 3.0 --guidance-interval 0.1 0.9] [--time-grid shifted]
+torchrun --standalone --nproc_per_node=2 -m vrae.training.nanovvm_video_pred.fvd --config $CONFIG \
+  --paths configs/paths.local.yaml --checkpoint <checkpoint> [--guidance-interval 0.1 0.9 --time-grid uniform]
+```
+
+The latent statistics, weights and data are the Wan path's above. With `cfg.mode: none`, a
+`cfg_scale != 1` at sampling applies naive CFG to u (two forwards per step, a heuristic; warned once).
+
 ## Tests
 
 ```bash
 CUDA_VISIBLE_DEVICES= PYTHONPATH=src python -m unittest \
   tests.test_nanovvm_video_pred tests.test_nanovvm_scaling_ladder tests.test_remote_video_storage \
-  tests.test_nanovvm_fvd tests.test_nanovvm_wan22 -v
+  tests.test_nanovvm_fvd tests.test_nanovvm_wan22 tests.test_nanovvm_meanflow -v
 ```
 
 The tests run on CPU with synthetic videos and small weights. Hide the GPUs on a GPU node, as above,
@@ -881,6 +1008,16 @@ because the end-to-end test keeps its tiny model on the CPU. They cover:
   counts and the 5B formula; the six configs (`--build-only`, shift sqrt(3), equality with the
   EUPE res128 twins, rejected settings); statistics, train, resume and sampling end to end; and the
   controls-only FVD with frame 0 passed to the controls.
+- for MeanFlow (`test_nanovvm_meanflow.py`): the default DiT's keys, parameter count and metadata and
+  the flow-matching transport metadata unchanged; zero-initialized h / guidance embeddings that leave the
+  output bit-identical; `torch.func.jvp` through the DiT against float64 central differences (with and
+  without drop, base head and guidance) and under no_grad in training mode with checkpointing; the
+  (t, r) samplers; the losses' reduction to velocity flow matching, the tangents, sub-batch vs
+  full-batch JVP; one drop mask per step; gradients (dudt constant, every parameter reached, one
+  forward through the wrapped model); omega / interval sampling, the guided targets against a
+  closed-form mock, MF fixed CFG; the sampler (1 step = `z1 - u(z1, 1, 1)`, N steps, CFG modes); the
+  engine, validation, metadata and resume rules; DDP on two gloo ranks; the 18 ladder files; and
+  train, resume, 1- and 2-step sampling and FVD end to end for MF and iMF-CFG with the aux head.
 
 The repository's `.gitignore` excludes `/tests/`, so these files were added with `git add -f`.
 
@@ -904,6 +1041,7 @@ The repository's `.gitignore` excludes `/tests/`, so these files were added with
 | `src/vrae/models/encoders/base.py` | `encode_images` single-image entry |
 | `src/vrae/models/video_vae/` | the Wan2.2 VAE source (`wan22.py`) and its backend (`backend.py`) |
 | `src/vrae/models/dit/wan_ti2v_dit.py` | the Wan2.2-TI2V DiT (`wan_ti2v_dit`) |
+| `src/vrae/models/dit/meanflow.py` | `MeanFlowTransport`: MF / iMF (t, r) sampling, JVP, losses, CFG, few-step sampler |
 
 `VRAEVideoDiT` now runs its encoder, decoder, and heads through a shared `_denoise`
 method, and its UCF101/Kinetics-600 outputs are unchanged. The Cityscapes 12-to-12 task

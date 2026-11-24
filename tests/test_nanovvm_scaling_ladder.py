@@ -557,7 +557,13 @@ class LadderConfigTest(unittest.TestCase):
                           + [str(ladder_res128_path(size).relative_to(LADDER)) for size in SIZES]
                           # Wan2.2 VAE + Wan2.2-TI2V DiT twins (tests/test_nanovvm_wan22.py)
                           + [f"{size}/wan22_ti2v_mix5_{size}_xpred_interval3_cond1gen16_res128_bs32_lr2e-4_wd0_ep1.yaml"
-                             for size in SIZES])
+                             for size in SIZES]
+                          # MeanFlow / iMF on the Wan path (tests/test_nanovvm_meanflow.py): mf and imf at every
+                          # size, the iMF-CFG and flow-matching-control runs at tiny, small and medium.
+                          + [f"{size}/wan22_ti2v_mix5_{size}_{variant}_upred_interval3_cond1gen16_res128_bs32_lr2e-4_wd0_ep1.yaml"
+                             for size in SIZES for variant in ("mf", "imf")]
+                          + [f"{size}/wan22_ti2v_mix5_{size}_{variant}_upred_interval3_cond1gen16_res128_bs32_lr2e-4_wd0_ep1.yaml"
+                             for size in ("tiny", "small", "medium") for variant in ("imfcfg", "fmctrl")])
         )
 
     def test_res128_variants(self):

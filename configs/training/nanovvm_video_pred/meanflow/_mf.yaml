@@ -1,0 +1,11 @@
+# MeanFlow (MF, Geng et al. 2025) for nanovvm_video_pred with wan_ti2v_dit; see _imf.yaml for the shared
+# keys. MF's tangent is the target itself (conditional: v_t = e - x), 25% of the rows keep r != t.
+# CFG: cfg.mode fixed bakes cfg.omega into the model (target omega v_t + (1 - omega) u(z, t, 0 | null),
+# MF Eq. 18-19) and then requires sampling.cfg_scale: 1; none trains without guidance.
+include: _imf.yaml
+transport:
+  variant: mf
+  ratio_r_neq_t: 0.25
+  tangent: conditional
+  cfg:
+    mode: none                  # none | fixed
