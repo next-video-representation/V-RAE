@@ -1398,7 +1398,100 @@ class MeanFlowEndToEndTest(unittest.TestCase):
             for name, config in variants.items():
                 with self.subTest(variant=name):
                     trained[name] = (backend, config, *self.run_variant(base, paths, backend, config, name))
+            with self.subTest(part="init_from_flow_matching"):
+                self.init_from_flow_matching(base, paths, backend, flow)
         return trained
+
+    def init_from_flow_matching(self, base: Path, paths, backend, flow: dict) -> None:
+        """Step 7: a MeanFlow run starts from a flow-matching checkpoint (only the zero layers are new)."""
+
+        from vrae.checkpoint import CheckpointError
+        from vrae.config import save_resolved_config
+        from vrae.training.common.contracts import create_run_metadata
+        from vrae.training.common.wandb import bind_wandb_run_name
+        from vrae.training.nanovvm_video_pred import sample
+        from vrae.training.nanovvm_video_pred import train as nv_train
+
+        def prepare(config: dict, name: str) -> tuple[dict, Path]:
+            config = copy.deepcopy(config)
+            config["run_name"] = name
+            config["wandb"] = bind_wandb_run_name(config["wandb"], name)
+            run = paths.training_run(config["task"], name, create=True)
+            for directory in ("checkpoints", "samples", "wandb"):
+                (run / directory).mkdir()
+            save_resolved_config(create_run_metadata(config), run / "run_metadata.yaml")
+            return config, run
+
+        flow_config, flow_run = prepare(flow, "flow_source")
+        with contextlib.redirect_stdout(io.StringIO()):
+            nv_train.train(flow_config, paths, flow_run, max_steps=1)
+        source = flow_run / "checkpoints" / "step-00000001.pt"
+        _, flow_dit, normalizer = sample.load_sampling_stack(flow_config, paths, source, torch.device("cpu"),
+                                                            use_ema=False)
+        stage1 = backend.metadata()
+        for cfg_mode in ("none", "conditioned"):
+            config = to_meanflow(flow, cfg_mode=cfg_mode)
+            config["training"]["init_from_flow_matching"] = str(source.relative_to(base))
+            nv_train.validate_build(config)
+            dit = nv_train.build_nanovvm_dit(config, stage1)
+            metadata = nv_train.nanovvm_model_metadata(config, stage1, dit, normalizer)
+            missing = nv_train.load_flow_matching_init(source, dit, expected_metadata=metadata)
+            self.assertEqual({key.split(".")[0] for key in missing}, set(dit.condition_embeddings()))
+            dit.eval()
+            generator = torch.Generator().manual_seed(0)
+            noisy = torch.randn(2, 4, 4, 48, generator=generator)
+            z0 = torch.randn(2, 4, 48, generator=generator)
+            extra = {"guidance_scale": torch.tensor([1.0, 4.0]), "guidance_interval": (0.2, 0.8)} \
+                if cfg_mode == "conditioned" else {}
+            with torch.no_grad():
+                self.assertTrue(torch.equal(
+                    dit(noisy, torch.tensor([0.3, 0.9]), z0, time_delta=torch.tensor([0.2, 0.6]), **extra),
+                    flow_dit(noisy, torch.tensor([0.3, 0.9]), z0)))
+        # Only the zero-initialized embeddings may be missing; the metadata must match otherwise.
+        aux = to_meanflow(flow, tangent="aux_head")
+        dit = nv_train.build_nanovvm_dit(aux, stage1)
+        with self.assertRaisesRegex(ValueError, "aux_v_blocks"):
+            nv_train.load_flow_matching_init(
+                source, dit, expected_metadata=nv_train.nanovvm_model_metadata(aux, stage1, dit, normalizer))
+        wider = to_meanflow(flow)
+        wider["dit"].update(dim=128, num_heads=2, ffn_dim=192)
+        dit = nv_train.build_nanovvm_dit(wider, stage1)
+        with self.assertRaisesRegex(CheckpointError, "dit_dim"):
+            nv_train.load_flow_matching_init(
+                source, dit, expected_metadata=nv_train.nanovvm_model_metadata(wider, stage1, dit, normalizer))
+        meanflow_source = paths.training_run("nanovvm_video_pred", "meanflow_mf") / "checkpoints" / "step-00000001.pt"
+        dit = nv_train.build_nanovvm_dit(to_meanflow(flow), stage1)
+        with self.assertRaisesRegex(ValueError, "not a flow-matching checkpoint"):
+            nv_train.load_flow_matching_init(meanflow_source, dit, expected_metadata={})
+        for mutate, match in (
+            (lambda c: c["training"].update(resume="ckpts/x.pt"), "excludes"),
+            (lambda c: c["training"].update(init_from="ckpts/x.pt"), "excludes"),
+            (lambda c: c["training"].update(init_from_flow_matching="/abs/x.pt"), "ckpts/"),
+        ):
+            broken = to_meanflow(flow)
+            broken["training"]["init_from_flow_matching"] = "ckpts/x.pt"
+            mutate(broken)
+            with self.assertRaisesRegex(ValueError, match):
+                nv_train.validate_build(broken)
+        flow_with_init = copy.deepcopy(flow)
+        flow_with_init["training"]["init_from_flow_matching"] = "ckpts/x.pt"
+        with self.assertRaisesRegex(ValueError, "transport.type: meanflow"):
+            nv_train.validate_build(flow_with_init)
+        # The trainer path: load, rebuild the EMA from the loaded weights, train.
+        config = to_meanflow(flow)
+        config["training"]["init_from_flow_matching"] = str(source.relative_to(base))
+        config, run = prepare(config, "meanflow_from_flow")
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            nv_train.train(config, paths, run, max_steps=1)
+        self.assertIn("[init] flow-matching weights", stdout.getvalue())
+        payload = torch.load(run / "checkpoints" / "step-00000001.pt", map_location="cpu", weights_only=False)
+        flow_state = torch.load(source, map_location="cpu", weights_only=False)["model"]
+        shadow = payload["ema"]["shadow"]
+        # One EMA step away from the flow-matching weights (decay 0.9995), not from a random init.
+        name = "blocks.0.self_attn.q.weight"
+        self.assertLess((shadow[name] - flow_state[name]).abs().max().item(),
+                        (payload["model"][name] - flow_state[name]).abs().max().item() + 1e-6)
 
 
 # ---------------------------------------------------------------- step 6: the configs

@@ -915,6 +915,13 @@ flow-matching `t_eps` that `_wan22_common.yaml` merges in.
 | `sampling.guidance_interval` | `[0.0, 1.0]` | iMF-CFG network input |
 | `sampling.time_grid` | `uniform` | `linspace(1, 0, N + 1)`, or `shifted` by `time_dist_shift` |
 | `training.grad_sync_check_steps` | 2 (flow matching 0) | DDP gradient check, ignored by resume |
+| `training.init_from_flow_matching` | null | a flow-matching checkpoint (`ckpts/...`) to start from; see below |
+
+`training.init_from_flow_matching` loads the live weights of a flow-matching checkpoint of the same
+DiT: its metadata must match except the transport and the MeanFlow DiT keys, and only the
+zero-initialized h / guidance embeddings may be missing (no aux v head, no extra keys), so the new
+model starts out computing the flow-matching model's output (an x-prediction, now read as u). The EMA
+restarts from the loaded weights. It excludes `init_from` and `resume`, and resume ignores it.
 
 Model metadata records the transport's algorithm fields (`type: meanflow`, variant, distributions,
 ratio, weights, tangent, cfg) and the DiT's MeanFlow keys; resuming with a different algorithm field

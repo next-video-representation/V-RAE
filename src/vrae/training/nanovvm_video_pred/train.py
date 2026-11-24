@@ -333,6 +333,15 @@ def validate_build(config: Mapping[str, Any]) -> dict[str, Any]:
             for key in keys:
                 if key in config.get(section, {}):
                     raise ValueError(f"{section}.{key} is a MeanFlow setting (transport.type: meanflow)")
+    flow_init = config["training"].get("init_from_flow_matching")
+    if flow_init:
+        from vrae.config import _checkpoint_relative_to_project
+
+        if transport.get("type") != "meanflow":
+            raise ValueError("training.init_from_flow_matching starts a MeanFlow run (transport.type: meanflow)")
+        if config["training"].get("init_from") or config["training"].get("resume"):
+            raise ValueError("training.init_from_flow_matching excludes training.init_from and training.resume")
+        _checkpoint_relative_to_project(flow_init, "training.init_from_flow_matching")
     checks = config["training"].get("grad_sync_check_steps", 0)
     if isinstance(checks, bool) or not isinstance(checks, int) or checks < 0:
         raise ValueError("training.grad_sync_check_steps must be a non-negative integer")
@@ -395,6 +404,46 @@ def validate_build(config: Mapping[str, Any]) -> dict[str, Any]:
     if kind != "vrae":
         summary["stage1_type"] = kind
     return summary
+
+
+def load_flow_matching_init(
+    path: str | Path, dit: nn.Module, *, expected_metadata: Mapping[str, Any]
+) -> list[str]:
+    """``training.init_from_flow_matching``: start a MeanFlow DiT from a flow-matching checkpoint.
+
+    The checkpoint's metadata must equal this run's except the transport and the DiT's MeanFlow keys;
+    its state may lack only the zero-initialized MeanFlow condition embeddings (so the loaded model
+    computes what the flow-matching one did, for every h and guidance input) and may have no extra
+    keys. Loads the live weights (``model``, as ``training.init_from``). Returns the missing keys.
+    """
+
+    from vrae.checkpoint import compare_metadata, load_checkpoint
+
+    payload = load_checkpoint(path)
+    recorded = payload["model_metadata"]
+    transport = recorded.get("transport") or {}
+    if "type" in transport or "t_eps" not in transport:
+        raise ValueError(f"{path} is not a flow-matching checkpoint (transport {transport})")
+    meanflow_keys = {f"dit_{key}" for key in MEANFLOW_DIT_KEYS}
+    if meanflow_keys & set(recorded):
+        raise ValueError(f"{path} already has MeanFlow DiT inputs")
+    compare_metadata(
+        expected_metadata,
+        recorded,
+        tuple(key for key in expected_metadata if key != "transport" and key not in meanflow_keys),
+    )
+    state = payload["model"]
+    target = dit.state_dict()
+    allowed = {key for key in target if key.split(".")[0] in dit.condition_embeddings()}
+    missing = sorted(set(target) - set(state))
+    unexpected = sorted(set(state) - set(target))
+    if unexpected or set(missing) - allowed:
+        raise ValueError(
+            "init_from_flow_matching may only lack the zero-initialized MeanFlow embeddings: "
+            f"missing {sorted(set(missing) - allowed)}, unexpected {unexpected}"
+        )
+    dit.load_state_dict(state, strict=False)
+    return missing
 
 
 def ensure_latent_stats(config: Mapping[str, Any], paths: ProjectPaths) -> Path:
@@ -845,6 +894,19 @@ def train(
             expected_metadata=model_metadata,
             metadata_fields=metadata_fields,
         )
+    flow_init_path = config["training"].get("init_from_flow_matching")
+    if flow_init_path:
+        missing = load_flow_matching_init(
+            paths.checkpoint(flow_init_path), dit, expected_metadata=model_metadata
+        )
+        # The EMA starts from the loaded weights, not the random initialization it cloned.
+        ema = ExponentialMovingAverage(dit, decay=float(config["training"]["ema"]["decay"]))
+        if distributed.is_main:
+            print(
+                f"[init] flow-matching weights from {flow_init_path}; zero-initialized: "
+                f"{sorted({key.split('.')[0] for key in missing})}",
+                flush=True,
+            )
     if resume_path:
         # Opt-in, as in the other V-RAE tasks: resume on a different GPU count. The global
         # batches stay the same (same global micro-batch); rank-local RNG streams are re-seeded.
@@ -1156,6 +1218,7 @@ __all__ = [
     "build_nanovvm_dit",
     "check_gradient_sync",
     "ensure_latent_stats",
+    "load_flow_matching_init",
     "load_latent_backend",
     "load_task_normalizer",
     "nanovvm_model_metadata",

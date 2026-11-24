@@ -176,6 +176,8 @@ def canonical_resume_config(config: Mapping[str, Any]) -> dict[str, Any]:
             "dataloader_timeout_seconds",
             # nanovvm_video_pred's DDP gradient-synchronization assertion (a check, not training).
             "grad_sync_check_steps",
+            # nanovvm_video_pred's MeanFlow start from flow-matching weights, like init_from.
+            "init_from_flow_matching",
         ):
             training.pop(runtime_only_key, None)
     transport = result.get("transport")
