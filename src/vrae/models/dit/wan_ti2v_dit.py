@@ -40,6 +40,25 @@ Deliberate deviations from Wan2.2-TI2V-5B (each also noted where it is implement
    t = 0, frames 1..4 at t), which equals Wan's per-token embedding without materializing
    ``[B, L, 6, d]``. RoPE angles are computed in float64 and applied in float32 (Wan rotates in
    float64).
+
+MeanFlow / improved MeanFlow additions (vrae.models.dit.meanflow), all off by default; with the
+defaults the module, its state_dict and ``architecture_metadata()`` are unchanged:
+
+6. ``time_delta_conditioning``: the interval ``h = t - r`` enters through ``time_delta_embedding``
+   (same form as ``time_embedding``, frame 0 at h = 0, the future frames at h), added to the time
+   embedding before ``time_projection``. Wan keeps embedding t per frame (it tells the clean z0 frame
+   from the noisy ones), so the network reads both t and h.
+7. ``guidance_conditioning``: the iMF guidance scale (embedded as ``1 - 1/omega``) and the guidance
+   interval ``(t_min, t_max)``, each through its own MLP of the same form, added to the time
+   embedding of every frame (z0 included) instead of iMF's in-context tokens.
+   The last Linear of every embedding in 6-7 is zero-initialized, so a new model computes exactly
+   what the same weights compute without them.
+8. ``aux_v_head_depth = K``: an auxiliary instantaneous-velocity branch for iMF, K independent blocks
+   and a head reading the hidden state after block L - K (the last K blocks + ``head`` are the u
+   branch). Only ``return_aux_v=True`` evaluates it.
+
+Float64 inputs keep float64 where Wan casts to float32 (``_upcast``), for finite-difference checks;
+bf16 / fp32 runs are bit-identical to Wan's casts.
 """
 
 from __future__ import annotations
@@ -122,11 +141,17 @@ def rope_cos_sin(
 def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
     """Rotate adjacent pairs ``(x[2i], x[2i+1])`` of ``[B,L,H,D]`` (Wan's view_as_complex layout)."""
 
-    pairs = x.float().reshape(*x.shape[:-1], -1, 2)
+    pairs = _upcast(x).reshape(*x.shape[:-1], -1, 2)
     even, odd = pairs.unbind(-1)
     cos = cos[None, :, None]
     sin = sin[None, :, None]
     return torch.stack((even * cos - odd * sin, even * sin + odd * cos), dim=-1).flatten(-2)
+
+
+def _upcast(x: torch.Tensor) -> torch.Tensor:
+    """Wan's ``.float()``; float64 stays float64 (finite-difference checks), the rest is identical."""
+
+    return x if x.dtype == torch.float64 else x.float()
 
 
 def _fp32_region(x: torch.Tensor):
@@ -143,7 +168,7 @@ class WanRMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(dim))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        value = x.float()
+        value = _upcast(x)
         return (value * torch.rsqrt(value.pow(2).mean(dim=-1, keepdim=True) + self.eps)).type_as(
             x
         ) * self.weight
@@ -154,7 +179,7 @@ class WanLayerNorm(nn.LayerNorm):
         super().__init__(dim, elementwise_affine=False, eps=eps)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return super().forward(x.float()).type_as(x)
+        return super().forward(_upcast(x)).type_as(x)
 
 
 class WanSelfAttention(nn.Module):
@@ -214,17 +239,17 @@ class WanTI2VBlock(nn.Module):
         width = x.shape[-1]
         with _fp32_region(x):
             # [B,T,1,d] chunks broadcast over the P tokens of each latent frame.
-            e = (self.modulation.float()[:, None] + e0.float()).unsqueeze(3).unbind(2)
+            e = (_upcast(self.modulation)[:, None] + _upcast(e0)).unsqueeze(3).unbind(2)
 
         def framed(value: torch.Tensor) -> torch.Tensor:
             return value.reshape(batch, frames, -1, width)
 
         y = self.self_attn(
-            (framed(self.norm1(x).float()) * (1 + e[1]) + e[0]).reshape(batch, -1, width), cos, sin
+            (framed(_upcast(self.norm1(x))) * (1 + e[1]) + e[0]).reshape(batch, -1, width), cos, sin
         )
         with _fp32_region(x):
             x = (framed(x) + framed(y) * e[2]).reshape(batch, -1, width)
-        y = self.ffn((framed(self.norm2(x).float()) * (1 + e[4]) + e[3]).reshape(batch, -1, width))
+        y = self.ffn((framed(_upcast(self.norm2(x))) * (1 + e[4]) + e[3]).reshape(batch, -1, width))
         with _fp32_region(x):
             x = (framed(x) + framed(y) * e[5]).reshape(batch, -1, width)
         return x
@@ -244,10 +269,10 @@ class WanTI2VHead(nn.Module):
 
         batch, frames, width = e.shape
         with _fp32_region(x):
-            shift, scale = (self.modulation.float()[:, None] + e.float().unsqueeze(2)).unsqueeze(
+            shift, scale = (_upcast(self.modulation)[:, None] + _upcast(e).unsqueeze(2)).unsqueeze(
                 3
             ).unbind(2)
-            normed = self.norm(x.float()).reshape(batch, frames, -1, width)
+            normed = self.norm(_upcast(x)).reshape(batch, frames, -1, width)
             return self.head((normed * (1 + scale) + shift).reshape(batch, -1, width))
 
 
@@ -256,6 +281,9 @@ class WanTI2VDiT(nn.Module):
 
     ``forward(noisy_future [B,F,h*w,C], time [B], context=z0 [B,h*w,C])`` -> ``[B,F,h*w,C]``
     (``(full, base)`` with ``return_base=True``). ``context`` and ``frame_features`` are aliases.
+    MeanFlow inputs (deviations 6-8): ``time_delta`` [B], ``guidance_scale`` and
+    ``guidance_interval=(t_min, t_max)`` (scalars or [B]); ``return_dict=True`` returns
+    ``{"full", "base" (return_base), "aux_v" (return_aux_v)}``.
     """
 
     def __init__(
@@ -278,6 +306,9 @@ class WanTI2VDiT(nn.Module):
         frame_dropout: float = 0.1,
         gradient_checkpointing: bool = False,
         use_gradient_checkpointing: bool | None = None,
+        time_delta_conditioning: bool = False,
+        guidance_conditioning: bool = False,
+        aux_v_head_depth: int = 0,
     ) -> None:
         super().__init__()
         grid = (int(grid_size), int(grid_size)) if isinstance(grid_size, int) else tuple(
@@ -309,6 +340,14 @@ class WanTI2VDiT(nn.Module):
             raise ValueError("base_depth must be in [1, num_layers]")
         if not 0 <= float(frame_dropout) <= 1:
             raise ValueError("frame_dropout must be in [0, 1]")
+        aux_v_head_depth = int(aux_v_head_depth)
+        if aux_v_head_depth < 0:
+            raise ValueError("aux_v_head_depth must be non-negative")
+        if aux_v_head_depth and base_depth > num_layers - aux_v_head_depth:
+            raise ValueError(
+                f"base_depth {base_depth} must be <= num_layers - aux_v_head_depth = "
+                f"{num_layers - aux_v_head_depth}: the base head reads the shared trunk"
+            )
         self.num_chunks = int(future_chunks)
         self.grid_size = grid
         self.in_channels = int(in_channels)
@@ -327,6 +366,9 @@ class WanTI2VDiT(nn.Module):
         self.gradient_checkpointing = bool(
             gradient_checkpointing if use_gradient_checkpointing is None else use_gradient_checkpointing
         )
+        self.time_delta_conditioning = bool(time_delta_conditioning)
+        self.guidance_conditioning = bool(guidance_conditioning)
+        self.aux_v_head_depth = aux_v_head_depth
 
         self.patch_embedding = nn.Conv3d(self.in_channels, self.dim, kernel_size=patch, stride=patch)
         self.time_embedding = nn.Sequential(
@@ -341,7 +383,33 @@ class WanTI2VDiT(nn.Module):
         self.base_head = WanTI2VHead(self.dim, self.in_channels, patch, self.eps)
         # Deviation 4: learned null z0 for classifier-free guidance (task-normalized space).
         self.null_condition = nn.Parameter(torch.zeros(1, 1, self.frame_tokens, self.in_channels))
+        # Deviations 6-8 (MeanFlow); registered last, absent with the defaults.
+        if self.time_delta_conditioning:
+            self.time_delta_embedding = self._embedding_mlp()
+        if self.guidance_conditioning:
+            self.guidance_scale_embedding = self._embedding_mlp()
+            self.guidance_start_embedding = self._embedding_mlp()
+            self.guidance_end_embedding = self._embedding_mlp()
+        if self.aux_v_head_depth:
+            self.aux_v_blocks = nn.ModuleList(
+                WanTI2VBlock(self.dim, self.ffn_dim, self.num_heads, self.eps)
+                for _ in range(self.aux_v_head_depth)
+            )
+            self.aux_v_head = WanTI2VHead(self.dim, self.in_channels, patch, self.eps)
         self.init_weights()
+
+    def _embedding_mlp(self) -> nn.Sequential:
+        """Same form as ``time_embedding``: ``Linear(freq_dim, d) -> SiLU -> Linear(d, d)``."""
+
+        return nn.Sequential(nn.Linear(self.freq_dim, self.dim), nn.SiLU(), nn.Linear(self.dim, self.dim))
+
+    def condition_embeddings(self) -> dict[str, nn.Sequential]:
+        """The zero-initialized MeanFlow condition embeddings present in this model (deviations 6-7)."""
+
+        names = ["time_delta_embedding"] if self.time_delta_conditioning else []
+        if self.guidance_conditioning:
+            names += ["guidance_scale_embedding", "guidance_start_embedding", "guidance_end_embedding"]
+        return {name: getattr(self, name) for name in names}
 
     # ----------------------------------------------------------------- interface
 
@@ -389,6 +457,10 @@ class WanTI2VDiT(nn.Module):
             "dit_rope_split": list(rope_split(self.dim // self.num_heads)),
             "dit_time_scale": TIME_SCALE,
             "dit_sequence": "z0_t0_then_future",
+            # MeanFlow keys only when enabled, so the flow-matching metadata is unchanged.
+            **({"dit_time_delta_conditioning": True} if self.time_delta_conditioning else {}),
+            **({"dit_guidance_conditioning": True} if self.guidance_conditioning else {}),
+            **({"dit_aux_v_head_depth": self.aux_v_head_depth} if self.aux_v_head_depth else {}),
         }
 
     def init_weights(self) -> None:
@@ -406,23 +478,56 @@ class WanTI2VDiT(nn.Module):
                 nn.init.normal_(module.weight, std=0.02)
         nn.init.zeros_(self.head.head.weight)
         nn.init.zeros_(self.base_head.head.weight)
+        # MeanFlow condition embeddings: first Linear like time_embedding, last Linear all zero, so
+        # they add exactly 0 at initialization (a flow-matching model's weights compute the same).
+        for embedding in self.condition_embeddings().values():
+            nn.init.normal_(embedding[0].weight, std=0.02)
+            nn.init.zeros_(embedding[2].weight)
+            nn.init.zeros_(embedding[2].bias)
+        if self.aux_v_head_depth:
+            nn.init.zeros_(self.aux_v_head.head.weight)
 
     # ------------------------------------------------------------------- forward
 
+    def _sinusoid(self, values: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+        return sinusoidal_embedding_1d(self.freq_dim, TIME_SCALE * values).to(dtype)
+
     def _time_embeddings(
-        self, time: torch.Tensor, frames: int
+        self,
+        time: torch.Tensor,
+        frames: int,
+        *,
+        time_delta: torch.Tensor | None = None,
+        guidance: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Per-frame ``e [B,T,d]`` and ``e0 [B,T,6,d]`` in fp32: frame 0 at t=0, the rest at t."""
+        """Per-frame ``e [B,T,d]`` and ``e0 [B,T,6,d]`` in fp32: frame 0 at t=0, the rest at t.
+
+        ``time_delta`` (h [B]; frame 0 at h = 0) and ``guidance`` (omega, t_min, t_max, each [B]; all
+        frames) add their embeddings to ``e`` before ``time_projection`` (deviations 6-7).
+        """
 
         batch = time.shape[0]
         values = torch.stack((torch.zeros_like(time), time), dim=1).flatten()  # [2B]: (0, t) pairs
         with _fp32_region(time):
-            sinusoid = sinusoidal_embedding_1d(self.freq_dim, TIME_SCALE * values).float()
-            e = self.time_embedding(sinusoid).unflatten(0, (batch, 2))
+            # .to(time.dtype) is Wan's .float() (the forward makes t float32) unless t is float64.
+            e = self.time_embedding(self._sinusoid(values, time.dtype)).unflatten(0, (batch, 2))
+            if time_delta is not None:
+                deltas = torch.stack((torch.zeros_like(time_delta), time_delta), dim=1).flatten()
+                e = e + self.time_delta_embedding(self._sinusoid(deltas, time.dtype)).unflatten(
+                    0, (batch, 2)
+                )
+            if guidance is not None:
+                scale, start, end = guidance
+                condition = (
+                    self.guidance_scale_embedding(self._sinusoid(1 - 1 / scale, time.dtype))
+                    + self.guidance_start_embedding(self._sinusoid(start, time.dtype))
+                    + self.guidance_end_embedding(self._sinusoid(end, time.dtype))
+                )
+                e = e + condition[:, None]
             e0 = self.time_projection(e).unflatten(2, (6, self.dim))
         index = torch.ones(frames, dtype=torch.long, device=time.device)
         index[0] = 0
-        return e.float()[:, index], e0.float()[:, index]
+        return _upcast(e)[:, index], _upcast(e0)[:, index]
 
     def _unpatchify(self, x: torch.Tensor, frames: int) -> torch.Tensor:
         """``[B, T*P, ph*pw*C]`` -> ``[B, T, h*w, C]`` (row-major tokens)."""
@@ -448,6 +553,11 @@ class WanTI2VDiT(nn.Module):
         condition_generator: torch.Generator | None = None,
         return_base: bool = False,
         return_intermediate: bool = False,
+        time_delta: torch.Tensor | float | None = None,
+        guidance_scale: torch.Tensor | float | None = None,
+        guidance_interval: Sequence[torch.Tensor | float] | None = None,
+        return_aux_v: bool = False,
+        return_dict: bool = False,
     ) -> Any:
         if frame_features is None:
             frame_features = context
@@ -476,7 +586,37 @@ class WanTI2VDiT(nn.Module):
             time = time.expand(batch)
         if time.ndim != 1 or time.shape[0] != batch:
             raise ValueError(f"time must have shape [{batch}], got {tuple(time.shape)}")
-        time = time.to(device=noisy_future.device, dtype=torch.float32)
+        time_dtype = torch.float64 if noisy_future.dtype == torch.float64 else torch.float32
+        time = time.to(device=noisy_future.device, dtype=time_dtype)
+
+        def per_sample(value: torch.Tensor | float, name: str) -> torch.Tensor:
+            value = torch.as_tensor(value, device=noisy_future.device, dtype=time_dtype)
+            if value.ndim == 0:
+                value = value.expand(batch)
+            if value.ndim != 1 or value.shape[0] != batch:
+                raise ValueError(f"{name} must be a scalar or have shape [{batch}], got {tuple(value.shape)}")
+            return value
+
+        if time_delta is not None and not self.time_delta_conditioning:
+            raise ValueError("time_delta needs time_delta_conditioning=True")
+        if self.time_delta_conditioning:
+            time_delta = per_sample(0.0 if time_delta is None else time_delta, "time_delta")
+        if (guidance_scale is not None or guidance_interval is not None) and not self.guidance_conditioning:
+            raise ValueError("guidance_scale / guidance_interval need guidance_conditioning=True")
+        guidance = None
+        if self.guidance_conditioning:
+            interval = (0.0, 1.0) if guidance_interval is None else tuple(guidance_interval)
+            if len(interval) != 2:
+                raise ValueError("guidance_interval must be (t_min, t_max)")
+            guidance = (
+                per_sample(1.0 if guidance_scale is None else guidance_scale, "guidance_scale"),
+                per_sample(interval[0], "guidance_interval[0]"),
+                per_sample(interval[1], "guidance_interval[1]"),
+            )
+        if return_aux_v and not self.aux_v_head_depth:
+            raise ValueError("return_aux_v needs aux_v_head_depth > 0")
+        if return_aux_v and not return_dict:
+            raise ValueError("return_aux_v needs return_dict=True")
 
         mask = _resolve_drop_mask(
             batch_size=batch,
@@ -498,20 +638,39 @@ class WanTI2VDiT(nn.Module):
         token_grid = tuple(int(value) for value in x.shape[2:])
         x = x.flatten(2).transpose(1, 2)  # [B,L,d], (frame,row,column) raster order
 
-        e, e0 = self._time_embeddings(time, frames)
+        e, e0 = self._time_embeddings(time, frames, time_delta=time_delta, guidance=guidance)
         cos, sin = rope_cos_sin(token_grid, self.dim // self.num_heads, self.rope_theta, x.device)
-        hidden_base: torch.Tensor | None = None
-        for index, block in enumerate(self.blocks, start=1):
+
+        def run(block: nn.Module, value: torch.Tensor) -> torch.Tensor:
             if self.gradient_checkpointing and self.training and torch.is_grad_enabled():
-                x = checkpoint(block, x, e0, cos, sin, use_reentrant=False)
-            else:
-                x = block(x, e0, cos, sin)
+                return checkpoint(block, value, e0, cos, sin, use_reentrant=False)
+            return block(value, e0, cos, sin)
+
+        hidden_base: torch.Tensor | None = None
+        hidden_split: torch.Tensor | None = None
+        split = self.num_layers - self.aux_v_head_depth  # deviation 8: the v branch forks here
+        for index, block in enumerate(self.blocks, start=1):
+            x = run(block, x)
             if index == self.base_depth:
                 hidden_base = x
+            if index == split:
+                hidden_split = x
         assert hidden_base is not None
         full = self._unpatchify(self.head(x, e), frames)[:, 1:]
         base = self._unpatchify(self.base_head(hidden_base, e), frames)[:, 1:]
-        result: Any = (full, base) if return_base else full
+        result: Any
+        if return_dict:
+            result = {"full": full}
+            if return_base:
+                result["base"] = base
+            if return_aux_v:
+                assert hidden_split is not None
+                value = hidden_split
+                for block in self.aux_v_blocks:
+                    value = run(block, value)
+                result["aux_v"] = self._unpatchify(self.aux_v_head(value, e), frames)[:, 1:]
+        else:
+            result = (full, base) if return_base else full
         if return_intermediate:
             return result, hidden_base
         return result
