@@ -867,6 +867,8 @@ def train(
                             config["sampling"]["internal_guidance_scale"]
                         ),
                         transport=transport,
+                        guidance_interval=config["sampling"].get("guidance_interval"),
+                        time_grid=config["sampling"].get("time_grid"),
                     )
                     predicted = decode_future_tokens(
                         stage1,

@@ -168,6 +168,9 @@ class VRAEFuturePredictor:
                 cfg_scale=float(self.sampling.get("cfg_scale", 1.0)),
                 internal_guidance_scale=float(self.sampling.get("internal_guidance_scale", 1.0)),
                 transport=self.transport,
+                # MeanFlow only; None (absent) leaves a flow-matching call unchanged.
+                guidance_interval=self.sampling.get("guidance_interval"),
+                time_grid=self.sampling.get("time_grid"),
             )
             return decode_future_tokens(
                 self.stage1, tokens, grid_size=self.grid_size, condition=condition
@@ -277,7 +280,10 @@ def main() -> None:
     from vrae.training.common.distributed import initialize_distributed
     from vrae.training.common.precision import PrecisionPolicy
     from vrae.training.nanovvm_video_pred.data import configure_nanovvm_storage
-    from vrae.training.nanovvm_video_pred.sample import load_sampling_stack
+    from vrae.training.nanovvm_video_pred.sample import (
+        add_meanflow_sampling_arguments,
+        load_sampling_stack,
+    )
     from vrae.training.nanovvm_video_pred.train import build_flow_transport, load_latent_backend
 
     parser = argparse.ArgumentParser(description="NanoVVM-protocol FVD of a nanovvm_video_pred checkpoint")
@@ -293,12 +299,17 @@ def main() -> None:
                         help="EMA weights: fvd.use_ema (config), or force on/off")
     parser.add_argument("--num-videos", type=int, default=None, help="score a seeded subset per split")
     parser.add_argument("--splits", nargs="+", default=None, help="only these fvd.splits")
+    add_meanflow_sampling_arguments(parser)
     arguments = parser.parse_args()
     if arguments.controls_only == (arguments.checkpoint is not None):
         parser.error("pass exactly one of --checkpoint or --controls-only")
     if arguments.controls_only and arguments.output is None:
         parser.error("--controls-only needs --output (there is no checkpoint run directory)")
     config = load_config(arguments.config)
+    if arguments.guidance_interval is not None:
+        config["sampling"]["guidance_interval"] = list(arguments.guidance_interval)
+    if arguments.time_grid is not None:
+        config["sampling"]["time_grid"] = arguments.time_grid
     paths = load_project_paths(
         config, override=arguments.paths, project_root=find_project_root(arguments.config)
     )

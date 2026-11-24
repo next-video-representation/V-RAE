@@ -98,8 +98,14 @@ def predict_future_tokens(
     transport: FlowMatchingTransport,
     cfg_scale: float = 1.0,
     internal_guidance_scale: float = 1.0,
+    guidance_interval: Sequence[float] | None = None,
+    time_grid: str | None = None,
 ) -> torch.Tensor:
-    """First-frame features ``[B,h*w,C_f]`` -> raw future latents ``[B,4,h*w,C]``."""
+    """First-frame features ``[B,h*w,C_f]`` -> raw future latents ``[B,4,h*w,C]``.
+
+    ``guidance_interval`` and ``time_grid`` (MeanFlowTransport) reach ``euler_sample`` only when set,
+    so a flow-matching call is unchanged.
+    """
 
     expected = (dit.frame_tokens, dit.frame_channels)
     if frame_features.ndim != 3 or tuple(frame_features.shape[1:]) != expected:
@@ -123,6 +129,11 @@ def predict_future_tokens(
             "frame_features": frame_features,
             "condition_drop_mask": torch.ones_like(keep),
         }
+    extra: dict[str, Any] = {}
+    if guidance_interval is not None:
+        extra["guidance_interval"] = tuple(float(value) for value in guidance_interval)
+    if time_grid is not None:
+        extra["time_grid"] = str(time_grid)
     normalized_future = transport.euler_sample(
         dit,
         noise,
@@ -131,6 +142,7 @@ def predict_future_tokens(
         num_steps=int(steps),
         cfg_scale=float(cfg_scale),
         ig_scale=float(internal_guidance_scale),
+        **extra,
     )
     return normalizer.denormalize(normalized_future)
 
@@ -148,6 +160,8 @@ def sample_from_first_frame(
     transport: FlowMatchingTransport,
     cfg_scale: float = 1.0,
     internal_guidance_scale: float = 1.0,
+    guidance_interval: Sequence[float] | None = None,
+    time_grid: str | None = None,
 ) -> torch.Tensor:
     """RGB first frames ``[B,3,H,W]`` -> decoded future RGB ``[B,16,3,H,W]``."""
 
@@ -163,6 +177,8 @@ def sample_from_first_frame(
         transport=transport,
         cfg_scale=cfg_scale,
         internal_guidance_scale=internal_guidance_scale,
+        guidance_interval=guidance_interval,
+        time_grid=time_grid,
     )
     return decode_future_tokens(
         stage1, tokens, grid_size=tuple(dit.grid_size), condition=raw_condition
@@ -252,6 +268,17 @@ def _sampling_settings(config: Mapping[str, Any], arguments: argparse.Namespace)
             else sampling.get("cfg_scale", 1.0)
         ),
         "internal_guidance_scale": float(sampling.get("internal_guidance_scale", 1.0)),
+        # MeanFlow only (absent from flow-matching configs, then not passed to the sampler).
+        "guidance_interval": (
+            arguments.guidance_interval
+            if getattr(arguments, "guidance_interval", None) is not None
+            else sampling.get("guidance_interval")
+        ),
+        "time_grid": (
+            arguments.time_grid
+            if getattr(arguments, "time_grid", None) is not None
+            else sampling.get("time_grid")
+        ),
     }
 
 
@@ -346,6 +373,15 @@ def run_sampling(arguments: argparse.Namespace) -> list[Path]:
     return written
 
 
+def add_meanflow_sampling_arguments(parser: argparse.ArgumentParser) -> None:
+    """``--guidance-interval`` / ``--time-grid`` (MeanFlow), overriding sampling.* of the config."""
+
+    parser.add_argument("--guidance-interval", type=float, nargs=2, metavar=("TMIN", "TMAX"), default=None,
+                        help="MeanFlow cfg.mode conditioned: the guidance interval fed to the network")
+    parser.add_argument("--time-grid", choices=("uniform", "shifted"), default=None,
+                        help="MeanFlow sampling grid: uniform linspace(1, 0, N+1) or shifted by time_dist_shift")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Sample NanoVVM future frames from one RGB frame")
     parser.add_argument("--config", required=True)
@@ -363,7 +399,9 @@ def main() -> None:
     parser.add_argument("--count", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--steps", type=int, default=None)
-    parser.add_argument("--cfg-scale", type=float, default=None)
+    parser.add_argument("--cfg-scale", type=float, default=None,
+                        help="CFG scale; with MeanFlow cfg.mode conditioned, the network's omega input")
+    add_meanflow_sampling_arguments(parser)
     parser.add_argument("--no-ema", action="store_true")
     arguments = parser.parse_args()
     for path in run_sampling(arguments):
@@ -375,6 +413,7 @@ if __name__ == "__main__":
 
 
 __all__ = [
+    "add_meanflow_sampling_arguments",
     "decode_future_tokens",
     "deterministic_future_noise",
     "load_first_frame_from_video",

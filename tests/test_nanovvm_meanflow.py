@@ -880,5 +880,145 @@ class GuidedGradientTest(unittest.TestCase):
                     self.assertGreater(dit.guidance_scale_embedding[2].weight.grad.abs().sum().item(), 0)
 
 
+# ---------------------------------------------------------------- step 4: the sampler
+
+
+class MeanFlowSamplerTest(unittest.TestCase):
+    """Test 10."""
+
+    def setUp(self):
+        self.dit = meanflow_dit(guidance_conditioning=True)
+        self.dit.eval()
+        self.noise, self.z0 = toy_batch(2, seed=5)
+        self.keep = torch.zeros(2, dtype=torch.bool)
+        self.kwargs = {"frame_features": self.z0, "condition_drop_mask": self.keep}
+        self.unconditional = {"frame_features": self.z0, "condition_drop_mask": torch.ones(2, dtype=torch.bool)}
+
+    def test_one_and_n_steps(self):
+        dit = meanflow_dit()
+        dit.eval()
+        transport = meanflow(variant="mf")
+        one = transport.euler_sample(dit, self.noise, model_kwargs=self.kwargs)
+        with torch.no_grad():
+            expected = self.noise - dit(self.noise, torch.ones(2), self.z0, time_delta=torch.ones(2),
+                                        condition_drop_mask=self.keep)
+        self.assertTrue(torch.equal(one, expected))
+        for grid_kind in ("uniform", "shifted"):
+            sample = transport.euler_sample(dit, self.noise, model_kwargs=self.kwargs, num_steps=3, time_grid=grid_kind,
+                                            return_trajectory=True)
+            grid = torch.linspace(1, 0, 4)
+            if grid_kind == "shifted":
+                grid = transport.shift_time(grid)
+            value = self.noise
+            with torch.no_grad():
+                for t, r in zip(grid[:-1], grid[1:]):
+                    u = dit(value, t.expand(2), self.z0, time_delta=(t - r).expand(2), condition_drop_mask=self.keep)
+                    value = value - (t - r) * u
+            with self.subTest(grid=grid_kind):
+                self.assertEqual(tuple(sample.shape), (4, 2, 4, 16, 48))
+                self.assertTrue(torch.equal(sample[-1], value))
+        with self.assertRaisesRegex(ValueError, "time_grid"):
+            transport.euler_sample(dit, self.noise, model_kwargs=self.kwargs, time_grid="cosine")
+        # Internal guidance as in flow matching, from the same single forward.
+        spy = Spy(dit)
+        guided = transport.euler_sample(spy, self.noise, model_kwargs=self.kwargs, ig_scale=1.5)
+        self.assertEqual(len(spy.calls), 1)
+        self.assertIn("return_base", spy.calls[0]["keys"])
+        with torch.no_grad():
+            full, base = dit(self.noise, torch.ones(2), self.z0, time_delta=torch.ones(2),
+                             condition_drop_mask=self.keep, return_base=True)
+        assert_close(guided, self.noise - (base + 1.5 * (full - base)), atol=1e-6)
+
+    def test_conditioned_guidance_is_a_network_input(self):
+        transport = meanflow(cfg={"mode": "conditioned"})
+        spy = Spy(self.dit)
+        sample = transport.euler_sample(spy, self.noise, model_kwargs=self.kwargs, unconditional_kwargs=self.unconditional,
+                                        num_steps=2, cfg_scale=3.0, guidance_interval=(0.2, 0.7))
+        self.assertEqual(len(spy.calls), 2)  # one forward per step, no unconditional branch
+        for call in spy.calls:
+            self.assertEqual(call["omega"], 3.0)
+            self.assertTrue(torch.equal(call["mask"], self.keep))
+            self.assertIn("guidance_interval", call["keys"])
+        value = self.noise
+        with torch.no_grad():
+            for t, r in ((1.0, 0.5), (0.5, 0.0)):
+                u = self.dit(value, torch.full((2,), t), self.z0, time_delta=torch.full((2,), t - r),
+                             condition_drop_mask=self.keep, guidance_scale=3.0, guidance_interval=(0.2, 0.7))
+                value = value - (t - r) * u
+        self.assertTrue(torch.equal(sample, value))
+        # Per-sample omega; the default interval is [0, 1].
+        spy.calls.clear()
+        transport.euler_sample(spy, self.noise, model_kwargs=self.kwargs, cfg_scale=torch.tensor([1.0, 4.0]))
+        self.assertTrue(torch.equal(spy.calls[0]["omega"], torch.tensor([1.0, 4.0])))
+        with self.assertRaisesRegex(ValueError, "guidance_interval"):
+            transport.euler_sample(self.dit, self.noise, model_kwargs=self.kwargs, guidance_interval=(0.8, 0.2))
+
+    def test_fixed_and_none_modes(self):
+        dit = meanflow_dit()
+        dit.eval()
+        fixed = meanflow(variant="mf", cfg={"mode": "fixed"})
+        with self.assertRaisesRegex(ValueError, "cfg_scale 1"):
+            fixed.euler_sample(dit, self.noise, model_kwargs=self.kwargs, unconditional_kwargs=self.unconditional,
+                               cfg_scale=2.0)
+        with self.assertRaisesRegex(ValueError, "conditioned only"):
+            fixed.euler_sample(dit, self.noise, model_kwargs=self.kwargs, guidance_interval=(0.1, 0.9))
+        fixed.euler_sample(dit, self.noise, model_kwargs=self.kwargs, guidance_interval=(0.0, 1.0))  # the default
+        plain = meanflow(variant="imf")
+        spy = Spy(dit)
+        MeanFlowTransport._warned_naive_cfg = False
+        with self.assertWarnsRegex(UserWarning, "heuristic"):
+            sample = plain.euler_sample(spy, self.noise, model_kwargs=self.kwargs,
+                                        unconditional_kwargs=self.unconditional, num_steps=2, cfg_scale=2.0)
+        self.assertEqual(len(spy.calls), 4)  # two forwards per step
+        self.assertEqual([bool(call["mask"].all()) for call in spy.calls], [False, True, False, True])
+        value = self.noise
+        with torch.no_grad():
+            for t, r in ((1.0, 0.5), (0.5, 0.0)):
+                arguments = dict(time_delta=torch.full((2,), t - r))
+                conditional = dit(value, torch.full((2,), t), self.z0, condition_drop_mask=self.keep, **arguments)
+                unconditional = dit(value, torch.full((2,), t), self.z0, condition_drop_mask=~self.keep, **arguments)
+                value = value - (t - r) * (unconditional + 2.0 * (conditional - unconditional))
+        assert_close(sample, value, atol=1e-6)
+        with unittest.mock.patch("warnings.warn") as warn:  # warned once per process
+            plain.euler_sample(dit, self.noise, model_kwargs=self.kwargs, unconditional_kwargs=self.unconditional,
+                               cfg_scale=2.0)
+        warn.assert_not_called()
+
+    def test_predict_future_tokens_passes_meanflow_options(self):
+        from vrae.training.common.latent_norm import LatentNormalizer
+        from vrae.training.nanovvm_video_pred import sample as nv_sample
+
+        normalizer = LatentNormalizer(torch.zeros(48), torch.ones(48))
+        recorded = []
+
+        class Recorder:
+            def euler_sample(self, model, noise, **kwargs):
+                recorded.append(kwargs)
+                return noise
+
+        arguments = dict(sample_indices=[0, 1], base_seed=1, steps=1, transport=Recorder())
+        nv_sample.predict_future_tokens(self.dit, self.z0, normalizer, **arguments)
+        self.assertNotIn("guidance_interval", recorded[-1])  # flow-matching calls are unchanged
+        self.assertNotIn("time_grid", recorded[-1])
+        nv_sample.predict_future_tokens(self.dit, self.z0, normalizer, guidance_interval=[0.1, 0.8],
+                                        time_grid="shifted", cfg_scale=2.0, **arguments)
+        self.assertEqual((recorded[-1]["guidance_interval"], recorded[-1]["time_grid"]), ((0.1, 0.8), "shifted"))
+        # The CLI options override sampling.* of the config.
+        import argparse
+
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--steps", type=int, default=None)
+        parser.add_argument("--cfg-scale", type=float, default=None)
+        nv_sample.add_meanflow_sampling_arguments(parser)
+        config = {"sampling": {"steps": 1, "cfg_scale": 2.0, "guidance_interval": [0.0, 1.0], "time_grid": "uniform"}}
+        settings = nv_sample._sampling_settings(config, parser.parse_args([]))
+        self.assertEqual((settings["guidance_interval"], settings["time_grid"]), ([0.0, 1.0], "uniform"))
+        settings = nv_sample._sampling_settings(
+            config, parser.parse_args(["--guidance-interval", "0.2", "0.6", "--time-grid", "shifted"]))
+        self.assertEqual((settings["guidance_interval"], settings["time_grid"]), ([0.2, 0.6], "shifted"))
+        flow = nv_sample._sampling_settings({"sampling": {"steps": 100}}, parser.parse_args([]))
+        self.assertEqual((flow["guidance_interval"], flow["time_grid"]), (None, None))
+
+
 if __name__ == "__main__":
     unittest.main()

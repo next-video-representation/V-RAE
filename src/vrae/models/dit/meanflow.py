@@ -37,7 +37,8 @@ The condition-dropout mask is drawn once per call and passed to every forward.
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping
+import warnings
+from collections.abc import Mapping, Sequence
 from contextlib import nullcontext
 from typing import Any
 
@@ -46,6 +47,7 @@ from torch import nn
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from vrae.models.dit.conditioning import sample_condition_dropout
+from vrae.models.dit.guidance import GuidanceInterval, guided_model_forward
 from vrae.models.dit.transport import FlowMatchingTransport, expand_time
 
 VARIANTS = ("mf", "imf")
@@ -56,6 +58,7 @@ CFG_MODES = {"mf": ("none", "fixed"), "imf": ("none", "conditioned")}
 DROPPED_TANGENTS = ("unconditional", "conditional")
 JVP_DTYPES = ("float32", "autocast")
 JVP_ATTENTION_BACKENDS = ("math", "default")
+TIME_GRIDS = ("uniform", "shifted")
 DEFAULT_ADAPTIVE_WEIGHT = {"p": 1.0, "eps": 0.01}
 DEFAULT_CFG = {
     "mode": "none",
@@ -586,5 +589,99 @@ class MeanFlowTransport:
             "guidance": guidance,
         }
 
+    # ------------------------------------------------------------------ sampling
 
-__all__ = ["LOSS_TERMS", "MeanFlowTransport", "adaptive_loss"]
+    _warned_naive_cfg = False
+
+    @torch.no_grad()
+    def euler_sample(
+        self,
+        model: nn.Module,
+        noise: torch.Tensor,
+        *,
+        model_kwargs: Mapping[str, Any] | None = None,
+        unconditional_kwargs: Mapping[str, Any] | None = None,
+        num_steps: int = 1,
+        steps: int | None = None,
+        cfg_scale: float | torch.Tensor = 1.0,
+        ig_scale: float | torch.Tensor = 1.0,
+        ig_intervals: Sequence[GuidanceInterval | tuple[float, float]] | None = None,
+        return_trajectory: bool = False,
+        guidance_interval: Sequence[float] | None = None,
+        time_grid: str | None = None,
+    ) -> torch.Tensor:
+        """Few-step MeanFlow sampling: ``z_r = z_t - (t - r) u(z_t, t, t - r)`` on a grid 1 -> 0.
+
+        Same call as ``FlowMatchingTransport.euler_sample``, plus ``guidance_interval`` (t_min, t_max)
+        and ``time_grid`` (``uniform`` linspace(1, 0, N + 1), the default and the official grid, or
+        ``shifted`` by the time_dist_shift like flow matching). Guidance by ``cfg.mode``:
+        ``conditioned``: ``cfg_scale`` is the network's omega input (scalar or [B]) together with the
+        guidance interval (default [0, 1]), one forward per step, ``unconditional_kwargs`` unused;
+        ``fixed``: omega is baked in, ``cfg_scale`` must be 1; ``none``: ``cfg_scale != 1`` applies
+        naive CFG to u (two forwards per step, a heuristic). Internal guidance as flow matching.
+        """
+
+        if steps is not None:
+            num_steps = int(steps)
+        if int(num_steps) <= 0:
+            raise ValueError("num_steps must be positive")
+        if not noise.is_floating_point() or noise.ndim < 2:
+            raise ValueError("noise must be a batched floating-point tensor")
+        grid_kind = "uniform" if time_grid is None else str(time_grid)
+        if grid_kind not in TIME_GRIDS:
+            raise ValueError(f"time_grid must be one of {TIME_GRIDS}")
+        interval = (0.0, 1.0) if guidance_interval is None else tuple(guidance_interval)
+        if len(interval) != 2 or not 0 <= float(interval[0]) <= float(interval[1]) <= 1:
+            raise ValueError("guidance_interval must be (t_min, t_max) with 0 <= t_min <= t_max <= 1")
+        mode = self.cfg_mode
+        if mode != "conditioned" and tuple(float(v) for v in interval) != (0.0, 1.0):
+            raise ValueError("guidance_interval is a network input of cfg.mode: conditioned only")
+        use_cfg = bool(torch.as_tensor(cfg_scale).ne(1).any())
+        if mode == "fixed" and use_cfg:
+            raise ValueError("cfg.mode fixed bakes omega into the model: sample with cfg_scale 1")
+        if mode == "none" and use_cfg and not MeanFlowTransport._warned_naive_cfg:
+            MeanFlowTransport._warned_naive_cfg = True
+            warnings.warn(
+                "MeanFlow trained without CFG (cfg.mode: none): cfg_scale != 1 extrapolates the average "
+                "velocity u like flow-matching CFG, a heuristic with two forwards per step",
+                stacklevel=2,
+            )
+        value = noise
+        grid = torch.linspace(1, 0, int(num_steps) + 1, device=value.device, dtype=torch.float32)
+        if grid_kind == "shifted":
+            grid = self.shift_time(grid)
+        trajectory = [value.clone()] if return_trajectory else None
+        batch = value.shape[0]
+        for index in range(int(num_steps)):
+            current, following = grid[index], grid[index + 1]
+            time = current.expand(batch)
+            time_delta = (current - following).expand(batch)
+            conditional = {**dict(model_kwargs or {}), "time_delta": time_delta}
+            unconditional = None
+            scale: float | torch.Tensor = 1.0
+            if mode == "conditioned":
+                conditional.update(guidance_scale=cfg_scale, guidance_interval=interval)
+            elif use_cfg:
+                if unconditional_kwargs is None:
+                    raise ValueError("unconditional_kwargs are required when cfg_scale is not 1")
+                unconditional = {**dict(unconditional_kwargs), "time_delta": time_delta}
+                scale = cfg_scale
+            velocity = guided_model_forward(
+                model,
+                value,
+                time,
+                condition_kwargs=conditional,
+                unconditional_kwargs=unconditional,
+                cfg_scale=scale,
+                ig_scale=ig_scale,
+                ig_intervals=ig_intervals,
+            )
+            value = value - (current - following).to(value.dtype) * velocity
+            if trajectory is not None:
+                trajectory.append(value.clone())
+        if trajectory is not None:
+            return torch.stack(trajectory)
+        return value
+
+
+__all__ = ["LOSS_TERMS", "MeanFlowTransport", "TIME_GRIDS", "adaptive_loss"]
