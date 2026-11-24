@@ -9,6 +9,10 @@ supervision, and the full/base flow-matching losses act on the future chunks onl
 that injects the clean first-frame latent z0 as latent frame 0 at t = 0
 (vrae.models.dit.wan_ti2v_dit). Data, transport, optimization, EMA, CFG dropout, internal
 guidance, sampling and FVD are this same loop.
+
+``transport.type: meanflow`` (wan_ti2v_dit only) trains MeanFlow / improved MeanFlow
+(vrae.models.dit.meanflow): u-prediction of the average velocity, the JVP on the unwrapped DiT,
+few-step sampling; see validate_meanflow for the required DiT and sampling settings.
 """
 
 from __future__ import annotations
@@ -17,7 +21,7 @@ import contextlib
 import json
 import math
 import os
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -203,6 +207,58 @@ def validate_training_recipe(training: Mapping[str, Any]) -> None:
         raise ValueError("training.clip_grad must be positive (or null for no clipping)")
 
 
+MEANFLOW_DIT_KEYS = ("time_delta_conditioning", "guidance_conditioning", "aux_v_head_depth")
+MEANFLOW_SAMPLING_KEYS = ("guidance_interval", "time_grid")
+
+
+def validate_meanflow(config: Mapping[str, Any], transport: Mapping[str, Any]) -> None:
+    """The DiT and sampling settings a ``transport.type: meanflow`` run needs (file-free)."""
+
+    from vrae.models.dit.meanflow import TIME_GRIDS
+    from vrae.models.dit.wan_ti2v_dit import wan_base_depth
+
+    dit = config["dit"]
+    sampling = config.get("sampling", {})
+    mode = transport["cfg"]["mode"]
+    if transport["prediction"] != "u":
+        raise ValueError("MeanFlow uses u-prediction (transport.prediction: u)")
+    if str(dit.get("name")) != WAN_DIT_NAME:
+        raise ValueError(f"transport.type meanflow needs dit.name {WAN_DIT_NAME}")
+    if not bool(dit.get("time_delta_conditioning", False)):
+        raise ValueError("MeanFlow needs dit.time_delta_conditioning: true (the network reads h = t - r)")
+    if bool(dit.get("guidance_conditioning", False)) != (mode == "conditioned"):
+        raise ValueError("dit.guidance_conditioning must be true exactly when transport.cfg.mode is conditioned")
+    depth = int(dit.get("aux_v_head_depth", 0))
+    if (depth > 0) != (transport["tangent"] == "aux_head"):
+        raise ValueError("dit.aux_v_head_depth must be > 0 exactly when transport.tangent is aux_head")
+    if depth:
+        layers = int(dit.get("num_layers", 30))
+        base_depth = dit.get("base_depth")
+        base_depth = wan_base_depth(layers) if base_depth is None else int(base_depth)
+        if base_depth > layers - depth:
+            raise ValueError(
+                f"dit.aux_v_head_depth {depth} leaves {layers - depth} shared blocks, fewer than "
+                f"dit.base_depth {base_depth}"
+            )
+    if mode != "none" and not float(dit.get("frame_dropout", 0.1)) > 0:
+        raise ValueError(f"transport.cfg.mode {mode} needs dit.frame_dropout > 0 (the null branch)")
+    if mode == "fixed" and float(sampling.get("cfg_scale", 1.0)) != 1:
+        raise ValueError("transport.cfg.mode fixed bakes omega into the model: sampling.cfg_scale must be 1")
+    if int(sampling.get("steps", 1)) < 1:
+        raise ValueError("sampling.steps must be >= 1")
+    interval = sampling.get("guidance_interval", [0.0, 1.0])
+    if (
+        not isinstance(interval, Sequence)
+        or len(interval) != 2
+        or not 0 <= float(interval[0]) <= float(interval[1]) <= 1
+    ):
+        raise ValueError("sampling.guidance_interval must be [t_min, t_max] with 0 <= t_min <= t_max <= 1")
+    if mode != "conditioned" and [float(value) for value in interval] != [0.0, 1.0]:
+        raise ValueError("sampling.guidance_interval is a network input of cfg.mode conditioned only")
+    if str(sampling.get("time_grid", "uniform")) not in TIME_GRIDS:
+        raise ValueError(f"sampling.time_grid must be one of {TIME_GRIDS}")
+
+
 def validate_build(config: Mapping[str, Any]) -> dict[str, Any]:
     """Static checks and the shape contract; reads no files (see check_data for paths)."""
 
@@ -268,8 +324,18 @@ def validate_build(config: Mapping[str, Any]) -> dict[str, Any]:
     validate_training_recipe(config["training"])
     fvd = validate_fvd_section(config)
     transport = flow_transport_metadata(config)
-    if transport["prediction"] != "x":
-        raise ValueError("NanoVVM future prediction uses x-prediction")
+    if transport.get("type") == "meanflow":
+        validate_meanflow(config, transport)
+    else:
+        if transport["prediction"] != "x":
+            raise ValueError("NanoVVM future prediction uses x-prediction")
+        for section, keys in (("dit", MEANFLOW_DIT_KEYS), ("sampling", MEANFLOW_SAMPLING_KEYS)):
+            for key in keys:
+                if key in config.get(section, {}):
+                    raise ValueError(f"{section}.{key} is a MeanFlow setting (transport.type: meanflow)")
+    checks = config["training"].get("grad_sync_check_steps", 0)
+    if isinstance(checks, bool) or not isinstance(checks, int) or checks < 0:
+        raise ValueError("training.grad_sync_check_steps must be a non-negative integer")
     if abs(transport["time_dist_shift"] - geometry["time_dist_shift"]) > 1e-9:
         raise ValueError(
             "transport.time_dist_shift must be sqrt(future_chunks*h*w*C/4096) = "
@@ -481,12 +547,19 @@ def rgb_unit(video: torch.Tensor) -> torch.Tensor:
     return video.float().div(255.0) if video.dtype == torch.uint8 else video.float()
 
 
-# NanoVVM metric names (nanovvm docs/wandb_metrics.md) for this trainer's loss terms.
+# NanoVVM metric names (nanovvm docs/wandb_metrics.md) for this trainer's loss terms; a transport
+# may log more (MeanFlowTransport.loss_terms), the flow-matching transport logs LOSS_TERMS.
 LOSS_TERMS = ("loss", "loss_full", "loss_base")
 LOSS_METRICS = {
     "loss": "loss/train",
     "loss_full": "loss/train_full",
     "loss_base": "loss/train_base",
+    "loss_aux_v": "loss/train_aux_v",
+    "mse_full": "mse/train_full",
+    "mse_base": "mse/train_base",
+    "mse_fm": "mse/train_fm",
+    "mse_mf": "mse/train_mf",
+    "dudt_rms": "stats/dudt_rms",
 }
 
 
@@ -501,9 +574,14 @@ class TrainMetrics:
     collectives: every rank calls them at the same steps.
     """
 
-    def __init__(self, device: torch.device, accumulation_steps: int) -> None:
+    def __init__(
+        self, device: torch.device, accumulation_steps: int, terms: Sequence[str] = LOSS_TERMS
+    ) -> None:
+        self.terms = tuple(terms)
+        if not self.terms or self.terms[0] != "loss" or set(self.terms) - set(LOSS_METRICS):
+            raise ValueError(f"loss terms must start with 'loss' and be among {sorted(LOSS_METRICS)}")
         self.accumulation_steps = int(accumulation_steps)
-        self._step = torch.zeros(len(LOSS_TERMS), dtype=torch.float64, device=device)
+        self._step = torch.zeros(len(self.terms), dtype=torch.float64, device=device)
         self._window = torch.zeros_like(self._step)
         self._epoch = torch.zeros_like(self._step)
         self._grad = torch.zeros(3, dtype=torch.float64, device=device)
@@ -512,7 +590,7 @@ class TrainMetrics:
         self.epoch_batches = 0
 
     def add_microbatch(self, losses: Mapping[str, torch.Tensor]) -> None:
-        values = torch.stack([losses[name].detach().reshape(()) for name in LOSS_TERMS])
+        values = torch.stack([losses[name].detach().reshape(()) for name in self.terms])
         self._step += values.double()
         self._epoch += values.double()
         self.epoch_batches += 1
@@ -542,7 +620,7 @@ class TrainMetrics:
 
     def log_values(self, *, clip_grad: float | None) -> dict[str, float]:
         losses = (reduce_mean(self._window) / max(self.window_steps, 1)).tolist()
-        values = {LOSS_METRICS[name]: value for name, value in zip(LOSS_TERMS, losses)}
+        values = {LOSS_METRICS[name]: value for name, value in zip(self.terms, losses)}
         if clip_grad:
             # Gradients are identical on every rank after the DDP all-reduce.
             grad = (self._grad / max(self.grad_steps, 1)).tolist()
@@ -563,6 +641,33 @@ class TrainMetrics:
         if batches == 0:
             return None
         return {"loss/train_epoch": total / batches}
+
+
+@torch.no_grad()
+def check_gradient_sync(module: nn.Module, *, count: int = 4) -> list[str]:
+    """Assert that DDP left the same gradients on every rank (py-meanflow's gradient_sanity_check).
+
+    All-gathers the norms of the ``count`` largest parameter gradients (before clipping) and raises if
+    any rank differs: a guard against a forward that bypassed DDP's gradient synchronization. Returns
+    the checked parameter names. A collective: every rank calls it at the same step.
+    """
+
+    import torch.distributed as dist
+
+    named = sorted(
+        ((name, parameter) for name, parameter in module.named_parameters() if parameter.grad is not None),
+        key=lambda item: (-item[1].numel(), item[0]),
+    )[: int(count)]
+    norms = torch.stack([parameter.grad.detach().float().norm() for _, parameter in named])
+    gathered = [torch.empty_like(norms) for _ in range(dist.get_world_size())]
+    dist.all_gather(gathered, norms)
+    for rank, values in enumerate(gathered):
+        if not torch.allclose(values, gathered[0], rtol=1e-5, atol=1e-12):
+            raise RuntimeError(
+                f"DDP gradients differ between ranks 0 and {rank} for "
+                f"{[name for name, _ in named]}: {gathered[0].tolist()} vs {values.tolist()}"
+            )
+    return [name for name, _ in named]
 
 
 @torch.no_grad()
@@ -642,6 +747,9 @@ def train(
     )
     scaler = precision.make_scaler()
     transport = build_flow_transport(config)
+    meanflow = model_metadata["transport"].get("type") == "meanflow"
+    # The JVP runs on the unwrapped DiT; check that DDP still synchronizes the gradients.
+    grad_sync_checks = int(config["training"].get("grad_sync_check_steps", 2 if meanflow else 0))
     dataset = build_nanovvm_dataset(config, paths, split="train")
     if distributed.is_main:
         print(f"[data] train: {len(dataset)} clips from {len(dataset.sources)} sources", flush=True)
@@ -782,7 +890,9 @@ def train(
     log_interval = int(config["wandb"]["log_interval"])
     sample_interval = int(config["wandb"]["sample_interval"])
     clip_grad = config["training"].get("clip_grad")
-    metrics = TrainMetrics(distributed.device, accumulation.steps)
+    metrics = TrainMetrics(
+        distributed.device, accumulation.steps, terms=getattr(transport, "loss_terms", LOSS_TERMS)
+    )
     data_wait = [0.0]  # seconds this rank waited for batches since the last log step
     cache_previous = storage.stats() if storage.remote and distributed.is_main else {}
     last_saved_step = step
@@ -801,13 +911,20 @@ def train(
                 future = normalizer.normalize(raw_future)
             with accumulation.sync_context(model):
                 with precision.autocast():
-                    losses = transport.training_losses(model, future, frame_features)
+                    if meanflow:  # model (maybe DDP) once with gradients, the JVP on the bare DiT
+                        losses = transport.training_losses(model, future, frame_features, jvp_model=dit)
+                    else:
+                        losses = transport.training_losses(model, future, frame_features)
                     loss = losses["loss"]
                 accumulation.backward(loss, scaler)
             metrics.add_microbatch(losses)
             sampler.commit_batch()
             if not accumulation.advance():
                 continue
+            if step < grad_sync_checks and distributed.world_size > 1:
+                checked = check_gradient_sync(dit)
+                if distributed.is_main:
+                    print(f"[grad-sync] step {step + 1}: gradients equal on all ranks {checked}", flush=True)
             stepped, grad_norm = clip_and_step(
                 optimizer,
                 scaler=scaler,
@@ -1037,6 +1154,7 @@ if __name__ == "__main__":
 __all__ = [
     "TrainMetrics",
     "build_nanovvm_dit",
+    "check_gradient_sync",
     "ensure_latent_stats",
     "load_latent_backend",
     "load_task_normalizer",
@@ -1046,5 +1164,6 @@ __all__ = [
     "task_geometry",
     "train",
     "validate_build",
+    "validate_meanflow",
     "validate_training_recipe",
 ]

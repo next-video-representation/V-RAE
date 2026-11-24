@@ -8,8 +8,15 @@ run on the tiny Wan2.2 VAE stand-in of tests/test_nanovvm_wan22.py. Run from the
 
 from __future__ import annotations
 
+import contextlib
+import copy
+import io
+import json
 import math
+import os
+import socket
 import sys
+import tempfile
 import unittest
 import unittest.mock
 from pathlib import Path
@@ -1018,6 +1025,384 @@ class MeanFlowSamplerTest(unittest.TestCase):
         self.assertEqual((settings["guidance_interval"], settings["time_grid"]), ([0.2, 0.6], "shifted"))
         flow = nv_sample._sampling_settings({"sampling": {"steps": 100}}, parser.parse_args([]))
         self.assertEqual((flow["guidance_interval"], flow["time_grid"]), (None, None))
+
+
+# ---------------------------------------------------------------- step 5: engine, train, metadata
+
+
+def to_meanflow(config: dict, *, variant: str = "imf", cfg_mode: str = "none", tangent: str | None = None) -> dict:
+    """A flow-matching nanovvm_video_pred config switched to MeanFlow (the meanflow/_*.yaml settings)."""
+
+    config = copy.deepcopy(config)
+    tangent = tangent or ("conditional" if variant == "mf" else "boundary")
+    config["transport"] = {
+        "type": "meanflow", "variant": variant, "prediction": "u", "time_dist_type": "logit-normal_0_1",
+        "time_dist_shift": config["transport"]["time_dist_shift"], "tr_sampler": "max_min",
+        "r_time_dist_type": None, "r_time_dist_shift": None, "ratio_r_neq_t": 0.25 if variant == "mf" else 0.5,
+        "adaptive_weight": {"p": 1.0, "eps": 0.01}, "tangent": tangent, "base_model_coeff": 1.0,
+        "aux_v_coeff": 1.0,
+        "cfg": {"mode": cfg_mode, "omega": 2.0, "omega_max": 8.0, "beta": 1.0, "interval": True,
+                "dropped_tangent": "unconditional"},
+        "jvp": {"dtype": "float32", "attention_backend": "math", "neq_subset_only": True},
+    }
+    config["dit"].update(time_delta_conditioning=True, guidance_conditioning=cfg_mode == "conditioned",
+                         aux_v_head_depth=1 if tangent == "aux_head" else 0)
+    config["sampling"].update(steps=1, cfg_scale=2.0 if cfg_mode == "conditioned" else 1.0,
+                              internal_guidance_scale=1.0, guidance_interval=[0.0, 1.0], time_grid="uniform")
+    return config
+
+
+def free_port() -> int:
+    with socket.socket() as handle:
+        handle.bind(("127.0.0.1", 0))
+        return handle.getsockname()[1]
+
+
+def _ddp_worker(rank: int, world: int, port: int, output: str) -> None:
+    import torch.distributed as dist
+    from torch.nn.parallel import DistributedDataParallel
+
+    from vrae.training.nanovvm_video_pred.train import check_gradient_sync
+
+    os.environ.update(MASTER_ADDR="127.0.0.1", MASTER_PORT=str(port))
+    dist.init_process_group("gloo", rank=rank, world_size=world)
+    try:
+        torch.set_num_threads(2)
+        dit = meanflow_dit(guidance_conditioning=True, aux_v_head_depth=1, gradient_checkpointing=True)
+        dit.train()
+        model = DistributedDataParallel(dit, broadcast_buffers=False)
+        transport = meanflow(tangent="aux_head", cfg={"mode": "conditioned"})
+        for step in range(2):  # a second step catches unused parameters (DDP reduction errors)
+            dit.zero_grad(set_to_none=True)
+            clean, z0 = toy_batch(4, seed=10 * step + rank)  # different data on every rank
+            losses = transport.training_losses(model, clean, z0, jvp_model=dit,
+                                               generator=torch.Generator().manual_seed(100 * step + rank))
+            losses["loss"].backward()
+            names = check_gradient_sync(dit)
+        flat = torch.cat([p.grad.flatten() for p in dit.parameters()])
+        gathered = [torch.zeros_like(flat) for _ in range(world)]
+        dist.all_gather(gathered, flat)
+        # A rank whose gradients were not synchronized is caught.
+        largest = max(dit.parameters(), key=lambda p: p.numel())
+        if rank == 1:
+            largest.grad.mul_(2)
+        try:
+            check_gradient_sync(dit)
+            caught = False
+        except RuntimeError:
+            caught = True
+        if rank == 0:
+            torch.save({"equal": all(torch.equal(gathered[0], g) for g in gathered), "names": names,
+                        "caught": caught, "loss": losses["loss"].item()}, output)
+    finally:
+        dist.destroy_process_group()
+
+
+class EngineAndValidationTest(unittest.TestCase):
+    """Test 11 (code side; the YAML files are tested in LadderMeanFlowConfigTest)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.flow = load_config(wan_ladder_path("tiny"))
+
+    def test_build_and_metadata(self):
+        from vrae.training.common.engine import build_flow_transport
+        from vrae.training.nanovvm_video_pred import train as nv_train
+
+        self.assertIsInstance(build_flow_transport(self.flow), FlowMatchingTransport)
+        explicit = copy.deepcopy(self.flow)
+        explicit["transport"]["type"] = "flow_matching"
+        self.assertIsInstance(build_flow_transport(explicit), FlowMatchingTransport)
+        self.assertEqual(flow_transport_metadata(explicit), flow_transport_metadata(self.flow))
+        broken = copy.deepcopy(self.flow)
+        broken["transport"]["type"] = "rectified"
+        with self.assertRaisesRegex(ValueError, "transport.type"):
+            build_flow_transport(broken)
+        for variant, cfg_mode, tangent in (("mf", "none", None), ("mf", "fixed", None), ("imf", "none", None),
+                                           ("imf", "conditioned", "aux_head")):
+            config = to_meanflow(self.flow, variant=variant, cfg_mode=cfg_mode, tangent=tangent)
+            if cfg_mode == "fixed":
+                config["sampling"]["cfg_scale"] = 1.0
+            transport = build_flow_transport(config)
+            self.assertIsInstance(transport, MeanFlowTransport)
+            metadata = flow_transport_metadata(config)
+            with self.subTest(variant=variant, cfg_mode=cfg_mode):
+                self.assertEqual(
+                    set(metadata),
+                    {"type", "variant", "prediction", "time_dist_type", "time_dist_shift", "tr_sampler",
+                     "r_time_dist_type", "r_time_dist_shift", "ratio_r_neq_t", "adaptive_weight", "tangent",
+                     "base_model_coeff", "aux_v_coeff", "cfg"},
+                )
+                self.assertNotIn("jvp", json.dumps(metadata))
+                self.assertEqual(metadata["cfg"]["mode"], cfg_mode)
+                summary = nv_train.validate_build(config)
+                self.assertEqual(summary["transport"], metadata)
+
+    def test_validation(self):
+        from vrae.training.nanovvm_video_pred import train as nv_train
+
+        base = to_meanflow(self.flow)
+        cfg = to_meanflow(self.flow, cfg_mode="conditioned")
+        aux = to_meanflow(self.flow, tangent="aux_head")
+        fixed = to_meanflow(self.flow, variant="mf", cfg_mode="fixed")
+        fixed["sampling"]["cfg_scale"] = 1.0
+        for config in (base, cfg, aux, fixed):
+            nv_train.validate_build(config)
+        for source, mutate, match in (
+            (base, lambda c: c["transport"].update(prediction="x"), "prediction"),
+            (base, lambda c: c["dit"].pop("time_delta_conditioning"), "time_delta_conditioning"),
+            (base, lambda c: c["dit"].update(guidance_conditioning=True), "guidance_conditioning"),
+            (cfg, lambda c: c["dit"].update(guidance_conditioning=False), "guidance_conditioning"),
+            (base, lambda c: c["dit"].update(aux_v_head_depth=1), "aux_v_head_depth"),
+            (aux, lambda c: c["dit"].update(aux_v_head_depth=0), "aux_v_head_depth"),
+            (aux, lambda c: c["dit"].update(aux_v_head_depth=4), "aux_v_head_depth"),  # tiny: 4 layers, base 1
+            (cfg, lambda c: c["dit"].update(frame_dropout=0.0), "frame_dropout"),
+            (fixed, lambda c: c["sampling"].update(cfg_scale=2.0), "cfg_scale"),
+            (base, lambda c: c["sampling"].update(steps=0), "sampling.steps"),
+            (cfg, lambda c: c["sampling"].update(guidance_interval=[0.7, 0.2]), "guidance_interval"),
+            (cfg, lambda c: c["sampling"].update(guidance_interval=[0.0, 1.5]), "guidance_interval"),
+            (base, lambda c: c["sampling"].update(guidance_interval=[0.1, 0.9]), "conditioned only"),
+            (base, lambda c: c["sampling"].update(time_grid="cosine"), "time_grid"),
+            (base, lambda c: c["dit"].update(name="vrae_first_frame_prediction_dit"), "wan_ti2v_dit"),
+            (base, lambda c: c["transport"].update(time_dist_shift=2.0), "time_dist_shift"),
+            (base, lambda c: c["transport"].update(t_eps=0.05), "t_eps"),
+            (base, lambda c: c["transport"].update(variant="mf"), "tangent"),
+            (base, lambda c: c["transport"]["cfg"].update(mode="fixed"), "cfg.mode"),
+            (base, lambda c: c["training"].update(grad_sync_check_steps=-1), "grad_sync_check_steps"),
+            # Flow-matching configs reject the MeanFlow-only keys.
+            (self.flow, lambda c: c["dit"].update(time_delta_conditioning=True), "MeanFlow setting"),
+            (self.flow, lambda c: c["sampling"].update(time_grid="uniform"), "MeanFlow setting"),
+        ):
+            broken = copy.deepcopy(source)
+            mutate(broken)
+            with self.subTest(match=match), self.assertRaisesRegex(ValueError, match):
+                nv_train.validate_build(broken)
+
+    def test_metadata_and_resume_rules(self):
+        """Test 12 (unit level; the end-to-end test resumes real checkpoints)."""
+
+        from vrae.checkpoint import CheckpointError, compare_metadata
+        from vrae.training.common.contracts import canonical_resume_config, compare_resolved_configs
+        from vrae.training.nanovvm_video_pred import train as nv_train
+
+        stage1 = {"type": "wan22_vae", "spatial_compression": 16, "temporal_compression": 4,
+                  "latent_channels": 48, "latent_grid": [8, 8]}
+        config = to_meanflow(self.flow, cfg_mode="conditioned", tangent="aux_head")
+        with torch.device("meta"):
+            dit = nv_train.build_nanovvm_dit(config, stage1)
+        self.assertEqual((dit.time_delta_conditioning, dit.guidance_conditioning, dit.aux_v_head_depth),
+                         (True, True, 1))
+        metadata = nv_train.nanovvm_model_metadata(config, stage1, dit)
+        self.assertEqual(metadata["transport"]["type"], "meanflow")
+        self.assertEqual((metadata["dit_time_delta_conditioning"], metadata["dit_guidance_conditioning"],
+                          metadata["dit_aux_v_head_depth"]), (True, True, 1))
+        runtime = copy.deepcopy(config)
+        runtime["transport"]["jvp"] = {"dtype": "autocast", "attention_backend": "default", "neq_subset_only": False}
+        runtime["training"]["grad_sync_check_steps"] = 5
+        compare_metadata(metadata, nv_train.nanovvm_model_metadata(runtime, stage1, dit), tuple(metadata))
+        compare_resolved_configs(config, runtime)
+        self.assertNotIn("jvp", canonical_resume_config(config)["transport"])
+        changed = copy.deepcopy(config)
+        changed["transport"]["ratio_r_neq_t"] = 0.25
+        with self.assertRaisesRegex(CheckpointError, "ratio_r_neq_t"):
+            compare_metadata(metadata, nv_train.nanovvm_model_metadata(changed, stage1, dit), tuple(metadata))
+        with self.assertRaisesRegex(CheckpointError, "ratio_r_neq_t"):
+            compare_resolved_configs(config, changed)
+        # A flow-matching config resolves exactly as before (no transport.jvp to drop).
+        self.assertEqual(canonical_resume_config(self.flow)["transport"], self.flow["transport"])
+
+
+class TrainLoopPiecesTest(unittest.TestCase):
+    def test_metrics_follow_the_transport_terms(self):
+        from vrae.models.dit.meanflow import LOSS_TERMS
+        from vrae.training.nanovvm_video_pred.train import TrainMetrics
+
+        metrics = TrainMetrics(torch.device("cpu"), accumulation_steps=1, terms=LOSS_TERMS)
+        metrics.add_microbatch({name: torch.tensor(float(index + 1)) for index, name in enumerate(LOSS_TERMS)})
+        metrics.end_step(stepped=True, grad_norm=torch.tensor(3.0), grad_numel=9, clip_grad=1.0)
+        values = metrics.log_values(clip_grad=1.0)
+        self.assertEqual(
+            {key: value for key, value in values.items() if not key.startswith("optimizer/")},
+            {"loss/train": 1.0, "loss/train_full": 2.0, "loss/train_base": 3.0, "loss/train_aux_v": 4.0,
+             "mse/train_full": 5.0, "mse/train_base": 6.0, "mse/train_fm": 7.0, "mse/train_mf": 8.0,
+             "stats/dudt_rms": 9.0},
+        )
+        self.assertEqual(values["optimizer/grad_norm"], 3.0)  # the pre-clip norm
+        self.assertEqual(TrainMetrics(torch.device("cpu"), 1).terms, ("loss", "loss_full", "loss_base"))
+        with self.assertRaisesRegex(ValueError, "loss terms"):
+            TrainMetrics(torch.device("cpu"), 1, terms=("loss", "something"))
+
+    def test_gradient_sync_check_under_ddp(self):
+        """Two gloo ranks, DDP(dit) with the JVP on the bare dit: gradients stay synchronized."""
+
+        import torch.multiprocessing as mp
+
+        with tempfile.TemporaryDirectory() as tmp:
+            output = str(Path(tmp) / "result.pt")
+            mp.spawn(_ddp_worker, args=(2, free_port(), output), nprocs=2, join=True)
+            result = torch.load(output)
+        self.assertTrue(result["equal"])
+        self.assertTrue(result["caught"])
+        self.assertEqual(len(result["names"]), 4)
+        self.assertTrue(math.isfinite(result["loss"]))
+
+
+class MeanFlowEndToEndTest(unittest.TestCase):
+    """Test 13: tiny Wan2.2 VAE stand-in; stats, train, resume, 1- and 2-step sampling, FVD."""
+
+    def run_variant(self, base: Path, paths, backend, config: dict, name: str) -> None:
+        from vrae.checkpoint import CheckpointError
+        from vrae.config import save_resolved_config
+        from vrae.training.common.contracts import create_run_metadata
+        from vrae.training.common.engine import build_flow_transport
+        from vrae.training.common.wandb import bind_wandb_run_name
+        from vrae.training.nanovvm_video_pred import sample
+        from vrae.training.nanovvm_video_pred import train as nv_train
+
+        config = copy.deepcopy(config)
+        config["run_name"] = f"meanflow_{name}"
+        config["wandb"] = bind_wandb_run_name(config["wandb"], config["run_name"])
+        nv_train.validate_build(config)
+        run = paths.training_run(config["task"], config["run_name"], create=True)
+        for directory in ("checkpoints", "samples", "wandb"):
+            (run / directory).mkdir()
+        save_resolved_config(create_run_metadata(config), run / "run_metadata.yaml")
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            nv_train.train(config, paths, run, max_steps=1)
+        logged = [json.loads(line) for line in stdout.getvalue().splitlines() if line.startswith("{")]
+        step_log = next(item for item in logged if "loss/train" in item)
+        for key in ("loss/train", "loss/train_full", "loss/train_base", "loss/train_aux_v", "mse/train_full",
+                    "mse/train_base", "mse/train_fm", "mse/train_mf", "stats/dudt_rms", "optimizer/grad_norm"):
+            self.assertIn(key, step_log)
+            self.assertTrue(math.isfinite(step_log[key]), key)
+        checkpoint = run / "checkpoints" / "step-00000001.pt"
+        payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
+        metadata = payload["model_metadata"]
+        self.assertEqual(metadata["transport"], build_flow_transport(config).metadata())
+        self.assertEqual(metadata["transport"]["type"], "meanflow")
+        self.assertNotIn("jvp", metadata["transport"])
+        self.assertTrue(metadata["dit_time_delta_conditioning"])
+        self.assertIn("time_delta_embedding.2.weight", payload["model"])
+        samples = torch.load(run / "samples" / "step-00000001.pt")
+        self.assertEqual(tuple(samples["predicted_future"].shape), (1, 16, 3, 32, 32))
+
+        # Resume: a different JVP precision / backend is accepted, a different ratio is not.
+        resumed = copy.deepcopy(config)
+        resumed["training"]["resume"] = str(checkpoint.relative_to(base))
+        resumed["transport"]["jvp"] = {"dtype": "autocast", "attention_backend": "math", "neq_subset_only": False}
+        rejected = copy.deepcopy(resumed)
+        rejected["transport"]["ratio_r_neq_t"] = 0.75
+        with self.assertRaisesRegex(CheckpointError, "ratio_r_neq_t"):
+            nv_train.train(rejected, paths, run, max_steps=2)
+        with contextlib.redirect_stdout(io.StringIO()):
+            nv_train.train(resumed, paths, run, max_steps=2)
+        self.assertTrue((run / "checkpoints" / "step-00000002.pt").is_file())
+
+        # 1- and 2-step sampling from the checkpoint, deterministic per seed.
+        stage1, dit, loaded = sample.load_sampling_stack(
+            config, paths, run / "checkpoints" / "step-00000002.pt", torch.device("cpu"))
+        transport = build_flow_transport(config)
+        first = torch.randint(0, 256, (1, 3, 32, 32), dtype=torch.uint8, generator=torch.Generator().manual_seed(0))
+        settings = dict(sample_indices=[0], base_seed=1, transport=transport,
+                        cfg_scale=float(config["sampling"]["cfg_scale"]),
+                        guidance_interval=config["sampling"]["guidance_interval"],
+                        time_grid=config["sampling"]["time_grid"])
+        videos = {}
+        for steps in (1, 2):
+            videos[steps] = sample.sample_from_first_frame(stage1, dit, loaded, first, steps=steps, **settings)
+            self.assertEqual(tuple(videos[steps].shape), (1, 16, 3, 32, 32))
+            self.assertTrue(torch.equal(videos[steps], sample.sample_from_first_frame(
+                stage1, dit, loaded, first, steps=steps, **settings)))
+        self.assertFalse(torch.equal(videos[1], videos[2]))
+        return dit, loaded, transport
+
+    def run_fvd(self, base: Path, backend, config: dict, name: str, dit, loaded, transport) -> None:
+        """The FVD path: model generation through MeanFlowTransport plus the controls (real decord)."""
+
+        from tests.test_nanovvm_fvd import ToyEncoder, fvd_data_root, fvd_section, write_encoder_files
+        from vrae.evaluation.nanovvm_fvd import fvd as engine
+        from vrae.paths import ProjectPaths
+        from vrae.storage.backend import configure_storage
+        from vrae.training.nanovvm_video_pred import fvd as task_fvd
+
+        fvd_root = fvd_data_root(base / f"fvd_{name}")
+        write_encoder_files(base)
+        fvd_paths = ProjectPaths(project_root=base, datasets={"nanovvm": fvd_root})
+        fvd_config_source = copy.deepcopy(config)
+        fvd_config_source["fvd"] = fvd_section(image_size=32)
+        fvd_config = task_fvd.resolve_fvd_config(fvd_config_source, fvd_paths)
+        generated = []
+        original = task_fvd.VRAEFuturePredictor.generate
+
+        def record(self_, condition, indices):
+            output = original(self_, condition, indices)
+            generated.append(output.shape)
+            return output
+
+        try:
+            with mock_patch(engine, "VideoEncoder", ToyEncoder), \
+                    mock_patch(task_fvd.VRAEFuturePredictor, "generate", record):
+                metrics = task_fvd.evaluate(
+                    config=fvd_config_source, paths=fvd_paths, fvd_config=fvd_config, stage1=backend, dit=dit,
+                    normalizer=loaded, transport=transport, autocast=contextlib.nullcontext, rank=0,
+                    world_size=1, device=torch.device("cpu"), run_dir=base / f"fvd_run_{name}", step=2,
+                    model_name="model",
+                )
+        finally:
+            configure_storage(None)
+        self.assertTrue(generated)
+        self.assertTrue(any(key.endswith("/model") for key in metrics))
+        self.assertTrue(all(math.isfinite(value) for value in metrics.values()))
+
+    def test_mf_and_imf(self):
+        from tests.test_nanovvm_video_pred import fake_decord, fake_wandb_module, replaced_module
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            with fake_decord(), replaced_module("wandb", fake_wandb_module()):
+                trained = self.train_variants(base)
+            # The FVD fixture writes real videos, so it runs after the toy decoder is gone.
+            for name, (backend, config, dit, loaded, transport) in trained.items():
+                with self.subTest(variant=name, part="fvd"):
+                    self.run_fvd(base, backend, config, name, dit, loaded, transport)
+
+    def train_variants(self, base: Path) -> dict:
+        from tests.test_nanovvm_video_pred import make_data_root
+        from tests.test_nanovvm_wan22 import load_tiny_backend, wan_task_config
+        from vrae.paths import ProjectPaths
+        from vrae.training.common.latent_norm import LatentNormalizer
+        from vrae.training.nanovvm_video_pred import latent_stats, sample
+        from vrae.training.nanovvm_video_pred import train as nv_train
+
+        root = make_data_root(base)
+        weights = base / "ckpts/pretrained/wan22_vae/Wan2.2_VAE.pth"
+        weights.parent.mkdir(parents=True)
+        weights.write_bytes(b"not real weights")
+        paths = ProjectPaths(project_root=base, datasets={"nanovvm": root})
+        flow = wan_task_config()
+        backend = load_tiny_backend(paths.checkpoint(flow["stage1"]["checkpoint"]),
+                                    precision=flow["stage1"]["precision"])
+        loader = unittest.mock.Mock(return_value=(backend, None))
+        variants = {
+            "mf": to_meanflow(flow, variant="mf"),
+            "imf_cfg_aux": to_meanflow(flow, variant="imf", cfg_mode="conditioned", tangent="aux_head"),
+        }
+        trained = {}
+        with (
+            mock_patch(latent_stats, "load_frozen_latent_backend", loader),
+            mock_patch(nv_train, "load_frozen_latent_backend", loader),
+            mock_patch(sample, "load_frozen_latent_backend", loader),
+        ):
+            LatentNormalizer.load(latent_stats.compute_nanovvm_latent_stats(flow, paths))
+            for name, config in variants.items():
+                with self.subTest(variant=name):
+                    trained[name] = (backend, config, *self.run_variant(base, paths, backend, config, name))
+        return trained
+
+
+def mock_patch(target, attribute, value):
+    return unittest.mock.patch.object(target, attribute, value)
 
 
 if __name__ == "__main__":

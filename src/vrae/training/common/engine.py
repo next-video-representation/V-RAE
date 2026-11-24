@@ -79,17 +79,36 @@ def resolve_runtime_gradient_checkpointing(configured: bool) -> bool:
     )
 
 
+TRANSPORT_TYPES = ("flow_matching", "meanflow")
+
+
 def build_flow_transport(config: Mapping[str, Any]):
+    """``transport.type``: ``flow_matching`` (default; the other keys go to FlowMatchingTransport as
+    before) or ``meanflow`` (vrae.models.dit.meanflow.MeanFlowTransport, nanovvm_video_pred only)."""
+
     from vrae.models.dit.transport import FlowMatchingTransport
 
     value = config.get("transport", {})
     if not isinstance(value, Mapping):
         raise TypeError("transport configuration must be a mapping")
-    return FlowMatchingTransport(**dict(value))
+    parameters = dict(value)
+    kind = str(parameters.get("type", "flow_matching"))
+    if kind == "meanflow":
+        from vrae.models.dit.meanflow import MeanFlowTransport
+
+        return MeanFlowTransport(**parameters)
+    if kind != "flow_matching":
+        raise ValueError(f"transport.type must be one of {TRANSPORT_TYPES}, got {kind!r}")
+    parameters.pop("type", None)
+    return FlowMatchingTransport(**parameters)
 
 
 def flow_transport_metadata(config: Mapping[str, Any]) -> dict[str, Any]:
+    from vrae.models.dit.meanflow import MeanFlowTransport
+
     transport = build_flow_transport(config)
+    if isinstance(transport, MeanFlowTransport):
+        return transport.metadata()
     return {
         "prediction": transport.prediction,
         "time_dist_type": transport.time_dist_type,

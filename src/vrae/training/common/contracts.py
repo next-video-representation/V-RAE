@@ -174,8 +174,15 @@ def canonical_resume_config(config: Mapping[str, Any]) -> dict[str, Any]:
             "prefetch_factor",
             "persistent_workers",
             "dataloader_timeout_seconds",
+            # nanovvm_video_pred's DDP gradient-synchronization assertion (a check, not training).
+            "grad_sync_check_steps",
         ):
             training.pop(runtime_only_key, None)
+    transport = result.get("transport")
+    if isinstance(transport, dict):
+        # MeanFlow's JVP precision / attention backend / sub-batching are runtime choices of how
+        # dudt is computed, so a run may resume with different ones (they are not in model metadata).
+        transport.pop("jvp", None)
     return result
 
 
