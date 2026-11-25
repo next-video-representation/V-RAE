@@ -129,7 +129,7 @@ My settings:
 - Config changes: none
 - Video storage: VRAE_STORAGE_CONFIG=configs/storage/adobe_s3.yaml, VRAE_VIDEO_CACHE=/mnt/localssd/yidongh/nanovvm/video_cache,
   VRAE_VIDEO_CACHE_GIB=300, VRAE_VIDEO_CACHE_RESERVE_GIB=100 (the same budget as NanoVVM runs on this node)
-- Compute: this node, A100 80 GB, 4 GPUs (NPROC_PER_NODE = count from `nvidia-smi -L`), P2, preemptible
+- Compute: this node, A100 80 GB, 8 GPUs (NPROC_PER_NODE = 2), P2, preemptible
 
 Storage rules:
 - The repository on Sensei FS holds code only. Write nothing into it except the new configs:
